@@ -42,7 +42,7 @@
 #define WIFI_MAX_RETRY      5
 
 /* --- MQTT Broker --- */
-#define MQTT_BROKER_URI     "mqtt://192.168.2.15"   // Sửa thành IP thật của Raspberry Pi
+#define MQTT_BROKER_URI     "mqtt://192.168.2.15"   // Cấu hình IP Raspberry Pi/BBB
 #define MQTT_PORT           1883
 #define MQTT_USERNAME       ""                       
 #define MQTT_PASSWORD       ""
@@ -61,21 +61,18 @@
 
 /* --- Cấu hình ADS1115 --- */
 #define ADS1115_I2C_ADDR    ADS111X_ADDR_GND  // 0x48
-#define SOIL_SENSOR_COUNT   4     
 
+// Cấu hình Vi sai (Differential): Dùng 4 chân tạo thành 2 kênh
+#define SOIL_SENSOR_COUNT   2     
 static const ads111x_mux_t SOIL_MUX[SOIL_SENSOR_COUNT] = {
-    ADS111X_MUX_0_GND,   
-    ADS111X_MUX_1_GND,   
-    ADS111X_MUX_2_GND,   
-    ADS111X_MUX_3_GND,   
+    ADS111X_MUX_0_1,   // Kênh vi sai 1 (AIN0 - AIN1)
+    ADS111X_MUX_2_3,   // Kênh vi sai 2 (AIN2 - AIN3)
 };
 
 /* --- Cấu hình BH1750 --- */
 #define BH1750_I2C_ADDR     BH1750_ADDR_LO    // 0x23
 
-/* --- Ngưỡng Edge AI cục bộ --- */
-#define SOIL_DRY_THRESHOLD      30.0f   
-#define SOIL_WET_THRESHOLD      70.0f   
+/* --- Ngưỡng Cảnh báo cục bộ (Hiển thị Serial) --- */
 #define LIGHT_LEAK_THRESHOLD    10.0f    
 
 /* --- Chu kỳ thu thập --- */
@@ -83,7 +80,7 @@ static const ads111x_mux_t SOIL_MUX[SOIL_SENSOR_COUNT] = {
 #define MQTT_PUBLISH_PERIOD_MS  10000   
 
 /* ===================== BỘ LỌC TRUNG BÌNH ĐỘNG DHT11 ===================== */
-#define DHT_FILTER_SIZE 5   // Kích thước cửa sổ lọc (Lấy trung bình 5 mẫu gần nhất)
+#define DHT_FILTER_SIZE 5   
 
 typedef struct {
     float temp_buf[DHT_FILTER_SIZE];
@@ -94,35 +91,19 @@ typedef struct {
 
 static dht_filter_t dht_ma = {0};
 
-/**
- * @brief Hàm tính toán Moving Average cho DHT11
- * @param new_t Nhiệt độ mới đọc được
- * @param new_h Độ ẩm mới đọc được
- * @param out_t Con trỏ lưu kết quả nhiệt độ đã lọc
- * @param out_h Con trỏ lưu kết quả độ ẩm đã lọc
- */
 static void dht11_moving_average(float new_t, float new_h, float *out_t, float *out_h) {
-    // Lưu giá trị mới vào bộ đệm vòng (circular buffer)
     dht_ma.temp_buf[dht_ma.index] = new_t;
     dht_ma.hum_buf[dht_ma.index]  = new_h;
     
-    // Tăng con trỏ, vòng lại 0 nếu chạm ngưỡng size
     dht_ma.index = (dht_ma.index + 1) % DHT_FILTER_SIZE;
+    if (dht_ma.count < DHT_FILTER_SIZE) dht_ma.count++;
     
-    // Tăng biến đếm số lượng mẫu hiện có (tối đa bằng DHT_FILTER_SIZE)
-    if (dht_ma.count < DHT_FILTER_SIZE) {
-        dht_ma.count++;
-    }
-    
-    // Tính tổng các mẫu hợp lệ
-    float sum_t = 0.0f;
-    float sum_h = 0.0f;
+    float sum_t = 0.0f, sum_h = 0.0f;
     for (int i = 0; i < dht_ma.count; i++) {
         sum_t += dht_ma.temp_buf[i];
         sum_h += dht_ma.hum_buf[i];
     }
     
-    // Trả về trung bình cộng
     *out_t = sum_t / dht_ma.count;
     *out_h = sum_h / dht_ma.count;
 }
@@ -152,7 +133,6 @@ static sensor_data_t g_sensor_data = {0};
 static int s_retry_num = 0;
 
 /* ===================== KHAI BÁO HÀM (WIFI, MQTT, INIT) ===================== */
-// (Các hàm wifi_init, mqtt_init, i2c_master_init, relay_init giữ nguyên nội dung cũ)
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
@@ -193,6 +173,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     switch ((esp_mqtt_event_id_t)event_id) {
         case MQTT_EVENT_CONNECTED:
             mqtt_connected = true;
+            // Subscribe vào Topic để nhận lệnh điều khiển máy bơm từ Server/Gateway
             esp_mqtt_client_subscribe(mqtt_client, TOPIC_CMD_PUMP, 1);
             break;
         case MQTT_EVENT_DISCONNECTED:
@@ -201,6 +182,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         case MQTT_EVENT_DATA:
             if (xSemaphoreTake(sensor_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
                 if (strncmp(event->topic, TOPIC_CMD_PUMP, event->topic_len) == 0) {
+                    // Cập nhật trạng thái máy bơm hoàn toàn dựa vào lệnh từ Gateway
                     if (strncmp(event->data, "ON", event->data_len) == 0) {
                         gpio_set_level(RELAY_PUMP_GPIO, 1); g_sensor_data.pump_state = true;
                     } else {
@@ -243,16 +225,6 @@ static float ads1115_to_soil_percent(double voltage) {
     return (V_DRY - (float)voltage) / (V_DRY - V_WET) * 100.0f;
 }
 
-static void relay_auto_control(sensor_data_t *data) {
-    if (mqtt_connected) return; 
-    float avg_soil = (data->humidity_soil[0] + data->humidity_soil[1] + data->humidity_soil[2] + data->humidity_soil[3]) / 4;
-    if (avg_soil < SOIL_DRY_THRESHOLD && !data->pump_state) {
-        gpio_set_level(RELAY_PUMP_GPIO, 1); data->pump_state = true;
-    } else if (avg_soil > SOIL_WET_THRESHOLD && data->pump_state) {
-        gpio_set_level(RELAY_PUMP_GPIO, 0); data->pump_state = false;
-    }
-}
-
 /* ===================== SENSOR TASK ===================== */
 static void sensor_task(void *pvParameters)
 {
@@ -264,7 +236,8 @@ static void sensor_task(void *pvParameters)
     ESP_ERROR_CHECK(bh1750_setup(&bh1750_dev, BH1750_MODE_CONTINUOUS, BH1750_RES_HIGH2)); 
 
     ESP_ERROR_CHECK(ads111x_init_desc(&ads_dev, ADS1115_I2C_ADDR, I2C_MASTER_PORT, I2C_MASTER_SDA, I2C_MASTER_SCL));
-    ESP_ERROR_CHECK(ads111x_set_mode(&ads_dev, ADS111X_MODE_SINGLE_SHOT));
+    // Chế độ Continuous và Data Rate 8 SPS
+    ESP_ERROR_CHECK(ads111x_set_mode(&ads_dev, ADS111X_MODE_CONTINUOUS));
     ESP_ERROR_CHECK(ads111x_set_data_rate(&ads_dev, ADS111X_DATA_RATE_8)); 
     ESP_ERROR_CHECK(ads111x_set_gain(&ads_dev, ADS111X_GAIN_4V096)); 
 
@@ -274,7 +247,6 @@ static void sensor_task(void *pvParameters)
     double   soil_v[SOIL_SENSOR_COUNT] = {0.0};
     float    soil_pct[SOIL_SENSOR_COUNT] = {0.0f};
 
-    // Các biến chứa giá trị DHT11 sau khi qua bộ lọc
     float filtered_temp = 0.0f;
     float filtered_hum = 0.0f;
 
@@ -284,7 +256,6 @@ static void sensor_task(void *pvParameters)
         /* Đọc và Lọc tín hiệu DHT11 */
         int dht_ret = dht11_read(&dht11, 3);
         if (dht_ret == 0) {
-            // Đẩy dữ liệu thô vào bộ lọc và lấy ra giá trị đã lọc (Moving Average)
             dht11_moving_average(dht11.temperature, dht11.humidity, &filtered_temp, &filtered_hum);
         }
         
@@ -294,16 +265,13 @@ static void sensor_task(void *pvParameters)
             real_lux = (float)bh_raw_level / 2.0f; 
         }
 
-        /* Đọc ADS1115 */
+        /* Đọc ADS1115 (Chế độ Continuous + Vi sai) */
         for (int i = 0; i < SOIL_SENSOR_COUNT; i++) {
             ads111x_set_input_mux(&ads_dev, SOIL_MUX[i]);
-            ads111x_start_conversion(&ads_dev); 
-
-            bool busy = true;
-            do {
-                ads111x_is_busy(&ads_dev, &busy);
-                if(busy) vTaskDelay(pdMS_TO_TICKS(10));
-            } while (busy);
+            
+            // Vì đang ở chế độ 8 SPS (125ms/mẫu), cần delay đợi ADC hoàn thành quá trình 
+            // lấy mẫu Oversampling cho kênh vi sai vừa được switch (an toàn: 150ms)
+            vTaskDelay(pdMS_TO_TICKS(150));
 
             if (ads111x_get_value(&ads_dev, &raw_soil_val) == ESP_OK) { 
                 soil_v[i] = (double)raw_soil_val * 4.096 / 32767.0;
@@ -311,10 +279,8 @@ static void sensor_task(void *pvParameters)
             }
         }
 
-        // --- BẢNG ĐIỀU KHIỂN & CẢNH BÁO ---
         printf("\n\n================ KẾT QUẢ ĐO ĐẠC ================\n");
         if (dht_ret == 0) {
-            // Hiển thị giá trị đã qua lớp lọc nhiễu
             printf("Nhiệt độ phòng ươm : %.1f °C (Đã lọc nhiễu)\n", filtered_temp);
             printf("Độ ẩm phòng ươm    : %.1f %% (Đã lọc nhiễu)\n", filtered_hum);
         } else {
@@ -334,20 +300,18 @@ static void sensor_task(void *pvParameters)
 
         printf("------------------------------------------------\n");
         for (int i = 0; i < SOIL_SENSOR_COUNT; i++) {
-            printf("Cảm biến Đất CH%d   : %.3f V ---> %.1f %%\n", i, soil_v[i], soil_pct[i]);
+            printf("Cảm biến Đất Vi sai CH%d : %.3f V ---> %.1f %%\n", i, soil_v[i], soil_pct[i]);
         }
         printf("================================================\n\n");
 
         if (xSemaphoreTake(sensor_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
             if (dht_ret == 0) { 
-                // Gửi dữ liệu ĐÃ LỌC lên khối cấu trúc chung
                 g_sensor_data.temperature = filtered_temp; 
                 g_sensor_data.humidity_air = filtered_hum; 
             }
             if (bh_ret == ESP_OK) g_sensor_data.light_lux = real_lux;
             for (int i = 0; i < SOIL_SENSOR_COUNT; i++) g_sensor_data.humidity_soil[i] = soil_pct[i];
             
-            relay_auto_control(&g_sensor_data);
             xSemaphoreGive(sensor_mutex);
         }
         
@@ -367,10 +331,9 @@ static void publish_sensor_json(void)
     } else return;
 
     int len = snprintf(json_buf, sizeof(json_buf),
-        "{\"node\":\"%s\",\"temp\":%.1f,\"hum\":%.1f,\"s1\":%.1f,\"s2\":%.1f,\"s3\":%.1f,\"s4\":%.1f,\"lux\":%.2f,\"pump\":%d}",
+        "{\"node\":\"%s\",\"temp\":%.1f,\"hum\":%.1f,\"s1\":%.1f,\"s2\":%.1f,\"lux\":%.2f,\"pump\":%d}",
         NODE_ID, snapshot.temperature, snapshot.humidity_air,
         snapshot.humidity_soil[0], snapshot.humidity_soil[1],
-        snapshot.humidity_soil[2], snapshot.humidity_soil[3],
         snapshot.light_lux, snapshot.pump_state ? 1 : 0
     );
 

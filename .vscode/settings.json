@@ -3,5 +3,6 @@
     "idf.port": "/dev/ttyUSB0",
     "idf.openOcdConfigs": [
         "board/esp32-wrover-kit-3.3v.cfg"
-    ]
+    ],
+    "cmake.sourceDirectory": "C:/D/Github/Plant-Monitoring-CPS/esp32/esp32_v1"
 }
