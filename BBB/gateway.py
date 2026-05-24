@@ -108,14 +108,13 @@ def setup_logging(debug: bool = False) -> logging.Logger:
     datefmt = "%Y-%m-%d %H:%M:%S"
 
     handlers = [logging.StreamHandler(sys.stdout)]
-    try:
-        handlers.append(logging.FileHandler(
-            os.path.join(BASE_DIR, "gateway.log"), encoding="utf-8"))
-    except Exception:
-        pass
 
-    logging.basicConfig(level=level, format=fmt,
-                        datefmt=datefmt, handlers=handlers)
+    logging.basicConfig(
+        level=level,
+        format=fmt,
+        datefmt=datefmt,
+        handlers=handlers
+    )
     return logging.getLogger("GATEWAY")
 
 
