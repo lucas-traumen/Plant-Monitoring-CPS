@@ -1,0 +1,6 @@
+[
+    "temperature",
+    "air_humidity",
+    "lux",
+    "soil_moisture"
+]

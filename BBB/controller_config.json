@@ -1,0 +1,9 @@
+{
+    "soil_force_on": 25,
+    "soil_force_off": 55,
+    "dry_soil_threshold": 35,
+    "min_on_steps": 1,
+    "max_on_steps_normal": 3,
+    "max_on_steps_dry": 6,
+    "cooldown_steps": 2
+}
