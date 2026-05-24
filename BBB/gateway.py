@@ -578,7 +578,7 @@ def push_influx(write_api, payload: dict, log):
             .field("step",      int(payload.get("step") or 0))
             .field("uptime_s",  int(payload.get("uptime_s",  0)))
             .field("wifi_rssi", int(payload.get("wifi_rssi", 0)))
-            .time(datetime.now(timezone.utc), WritePrecision.SECONDS)
+            .time(datetime.now(timezone.utc), WritePrecision.S)
         )
         write_api.write(bucket=INFLUX_BUCKET, record=point)
         log.debug(f"[InfluxDB] ✓ step={payload.get('step')}")
