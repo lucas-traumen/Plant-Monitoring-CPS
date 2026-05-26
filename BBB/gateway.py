@@ -23,9 +23,9 @@ Cài đặt:
 Chạy:
     python gateway.py --debug
 
-Lưu ý bảo mật:
-    Không hard-code INFLUX_TOKEN trong source.
-    Hãy set bằng biến môi trường hoặc systemd EnvironmentFile.
+Lưu ý:
+    File này giữ fallback InfluxDB token theo yêu cầu để chạy ngay.
+    Có thể override bằng biến môi trường nếu cần.
 """
 
 from __future__ import annotations
@@ -66,7 +66,7 @@ BASE_DIR = Path(__file__).resolve().parent
 
 NODE_ID = "BRASSICA_JUNCEA_01"
 PLANT_NAME = "Rau Cải Mầm (Brassica juncea)"
-GW_VERSION = "3.2-influx-dt-bridge-secure"
+GW_VERSION = "3.3-influx-dt-bridge-token-fallback"
 
 MODEL_PATH = BASE_DIR / "watering_random_forest_model.pkl"
 FEATURES_PATH = BASE_DIR / "model_features.json"
@@ -90,6 +90,15 @@ TOPIC_CMD_LIGHT = "cps/greenhouse/cmd/light"  # legacy/manual, không publish tr
 # BBB Influx Bridge -> ESP32: Digital Twin direct command
 TOPIC_DT_CMD_PUMP = "cps/greenhouse/dt/cmd/pump"
 TOPIC_DT_CMD_LIGHT = "cps/greenhouse/dt/cmd/light"
+
+# ── InfluxDB Cloud ───────────────────────────────────────────────────────────
+# Giữ fallback hard-code theo file cũ để chạy ngay.
+# Có thể override bằng biến môi trường nếu cần.
+INFLUX_URL_DEFAULT = "https://us-east-1-1.aws.cloud2.influxdata.com"
+INFLUX_TOKEN_DEFAULT = "6pSuWQaFLlWq6iRVfaRYEMwIO1DDEChBsG42HdDx5En6fuqpUx95j3xswbVNrcWxRrs_sizN6XXESjzNqcHzJA=="
+INFLUX_ORG_DEFAULT = "DEV_TEAM"
+INFLUX_BUCKET_DEFAULT = "digital_twin_data"
+
 
 WRITE_PRECISION_SECONDS = getattr(WritePrecision, "S", None) or getattr(WritePrecision, "SECONDS")
 
@@ -227,15 +236,13 @@ class InfluxManager:
 
     def __init__(self, log: logging.Logger):
         self.log = log
-        self.url = os.getenv("INFLUX_URL", "https://us-east-1-1.aws.cloud2.influxdata.com")
-        self.token = os.getenv("INFLUX_TOKEN", "")
-        self.org = os.getenv("INFLUX_ORG", "DEV_TEAM")
-        self.bucket = os.getenv("INFLUX_BUCKET", "digital_twin_data")
+        self.url = os.getenv("INFLUX_URL", INFLUX_URL_DEFAULT)
+        self.token = os.getenv("INFLUX_TOKEN", INFLUX_TOKEN_DEFAULT)
+        self.org = os.getenv("INFLUX_ORG", INFLUX_ORG_DEFAULT)
+        self.bucket = os.getenv("INFLUX_BUCKET", INFLUX_BUCKET_DEFAULT)
 
         if not self.token:
-            raise RuntimeError(
-                "Thiếu INFLUX_TOKEN. Không hard-code token trong source; hãy export INFLUX_TOKEN hoặc dùng systemd EnvironmentFile."
-            )
+            raise RuntimeError("Thiếu INFLUX_TOKEN: kiểm tra INFLUX_TOKEN_DEFAULT hoặc biến môi trường INFLUX_TOKEN.")
 
         self.client = InfluxDBClient(url=self.url, token=self.token, org=self.org)
         self.client.ping()
