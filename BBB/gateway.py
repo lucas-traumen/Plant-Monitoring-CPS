@@ -350,6 +350,32 @@ class InfluxManager:
         )
         self.write_api.write(bucket=self.bucket, record=point)
 
+    def write_planting_start_state(self, raw: dict) -> None:
+        """Persist the latest planting_start ACK/config returned by ESP32."""
+        command_id = str(raw.get("command_id") or raw.get("id") or "")
+        event = str(raw.get("event") or "")
+        status = str(raw.get("status") or "")
+        source = str(raw.get("source") or "ESP32")
+        epoch = safe_int(raw.get("planting_start_epoch"), 0)
+        start_time = str(raw.get("planting_start_time") or "")
+        error = str(raw.get("error") or "")
+
+        point = (
+            Point("planting_start_state")
+            .tag("node_id", raw.get("node_id", NODE_ID))
+            .tag("target", "planting_start")
+            .tag("status", status or "UNKNOWN")
+            .tag("event", event or "unknown")
+            .field("command_id", command_id)
+            .field("source", source)
+            .field("planting_start_epoch", int(epoch))
+            .field("planting_start_time", start_time)
+            .field("error", error)
+            .field("raw_json", json.dumps(raw, ensure_ascii=False))
+            .time(datetime.now(timezone.utc), WRITE_PRECISION_SECONDS)
+        )
+        self.write_api.write(bucket=self.bucket, record=point)
+
     def write_command_event(self, command_id: str, target: str, status: str, message: str = "") -> None:
         point = (
             Point("dt_command_events")
@@ -911,6 +937,12 @@ class GatewayApp:
         self.processed_command_ids: set[str] = set()
         self.sent_commands: dict[str, dict] = {}
 
+        # Chống spam cmd/pump: chỉ publish khi trạng thái đổi,
+        # hoặc sau một khoảng heartbeat để ESP32 nhận lại nếu vừa reconnect.
+        self.last_pump_sent: Optional[str] = None
+        self.last_pump_sent_at: float = 0.0
+        self.pump_heartbeat_s: float = 30.0
+
     # -------------------------------------------------------------------------
     # Lifecycle
     # -------------------------------------------------------------------------
@@ -1054,8 +1086,22 @@ class GatewayApp:
         if self._is_direct_active("pump"):
             self.log.warning(f"SKIP AUTO {TOPIC_CMD_PUMP}: Digital Twin direct pump active.")
         else:
-            self.client.publish(TOPIC_CMD_PUMP, pump_state, qos=MQTT_QOS)
-            self.log.info(f"→ {TOPIC_CMD_PUMP}: {pump_state}")
+            now = time.time()
+            should_publish = (
+                pump_state != self.last_pump_sent
+                or (now - self.last_pump_sent_at) >= self.pump_heartbeat_s
+            )
+
+            if should_publish:
+                result = self.client.publish(TOPIC_CMD_PUMP, pump_state, qos=MQTT_QOS)
+                if result.rc == mqtt.MQTT_ERR_SUCCESS:
+                    self.last_pump_sent = pump_state
+                    self.last_pump_sent_at = now
+                    self.log.info(f"→ {TOPIC_CMD_PUMP}: {pump_state}")
+                else:
+                    self.log.error(f"→ {TOPIC_CMD_PUMP} FAILED rc={result.rc}")
+            else:
+                self.log.debug(f"Skip duplicate {TOPIC_CMD_PUMP}: {pump_state}")
 
         self.influx.enqueue_telemetry(payload)
         try:
@@ -1076,8 +1122,11 @@ class GatewayApp:
         light_state = state["light"]["state"]
 
         for command_id, cmd in list(self.sent_commands.items()):
-            target = cmd["target"]
-            expected = cmd["state"]
+            target = cmd.get("target")
+            if target not in ("pump", "light"):
+                continue
+
+            expected = cmd.get("state")
             actual = pump_state if target == "pump" else light_state
             if actual == expected:
                 try:
@@ -1113,6 +1162,12 @@ class GatewayApp:
         if not command_id or not is_planting_ack:
             return
 
+        try:
+            self.influx.write_planting_start_state(raw)
+            self.influx.write_latest_state("planting_start", raw)
+        except Exception as exc:
+            self.log.error(f"[InfluxDB] planting_start_state write error: {exc}")
+
         # ESP32 should normally respond with status=DONE for SET_NOW/SET_EPOCH/CLEAR/GET.
         done_events = {
             "planting_start_updated",
@@ -1138,6 +1193,15 @@ class GatewayApp:
 
         self.processed_command_ids.add(command_id)
         self.sent_commands.pop(command_id, None)
+
+        # Planting_start command is published as retained config command.
+        # After ESP32 ACKs, clear retained payload so old config command won't replay forever.
+        if event_status == "DONE":
+            clear_ret = self.client.publish(TOPIC_CMD_PLANTING_START, payload=None, qos=MQTT_QOS, retain=True)
+            if clear_ret.rc == mqtt.MQTT_ERR_SUCCESS:
+                self.log.info(f"[PLANTING_ACK] cleared retained {TOPIC_CMD_PLANTING_START}")
+            else:
+                self.log.warning(f"[PLANTING_ACK] clear retained failed rc={clear_ret.rc}")
 
         self.log.info(
             f"[PLANTING_ACK] command_id={command_id} event={event} "
@@ -1247,6 +1311,7 @@ class GatewayApp:
             TOPIC_CMD_PLANTING_START,
             json.dumps(payload, ensure_ascii=False),
             qos=MQTT_QOS,
+            retain=True,
         )
 
         if result.rc == mqtt.MQTT_ERR_SUCCESS:
@@ -1336,3 +1401,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
