@@ -87,7 +87,7 @@ static const wifi_cred_t WIFI_NETWORKS[] = {
 #define FW_VERSION           "2.7.0-rtc-nvs-phase-dt-stable"
 
 /* MQTT */
-#define MQTT_BROKER_URI      "mqtt://192.168.100.120"  /* IP hiện tại của BBB/Mosquitto */
+#define MQTT_BROKER_URI      "mqtt://192.168.2.12"  /* IP hiện tại của BBB/Mosquitto */
 #define MQTT_PORT            1883
 #define MQTT_KEEPALIVE_S     60
 #define MQTT_QOS             1
@@ -112,8 +112,8 @@ static const wifi_cred_t WIFI_NETWORKS[] = {
 #define I2C_MASTER_PORT      I2C_NUM_0
 
 #define DHT11_GPIO           16
-#define RELAY_PUMP_GPIO      26      /* Active HIGH */
-#define RELAY_LIGHT_GPIO     27      /* Active HIGH */
+#define RELAY_PUMP_GPIO      19      /* Active HIGH */
+#define RELAY_LIGHT_GPIO     18      /* Active HIGH */
 
 /* ADS1115 Configuration */
 #define ADS1115_I2C_ADDR     ADS111X_ADDR_GND   /* 0x48 */
@@ -194,8 +194,8 @@ static const ads111x_mux_t SOIL_MUX[SOIL_CH_COUNT] = {
 #define CORE_NET            0
 #define CORE_APP            1
 
-#define LIGHT_ON_HOUR_UTC7   8
-#define LIGHT_OFF_HOUR_UTC7  17
+#define LIGHT_ON_HOUR_UTC7   6
+#define LIGHT_OFF_HOUR_UTC7  20
 
 /* ADS1115 Calibration */
 #define SOIL_V_DRY           3.0f
@@ -1930,4 +1930,3 @@ void app_main(void) {
 
     ESP_LOGI(TAG, "Tất cả tasks đã khởi động (RTC phase owner + Multi-WiFi + DT direct actuator)");
 }
-
