@@ -1,15 +1,15 @@
 /**
  * @file main.c
- * @brief ESP32 Firmware v2.3 — Rau Cai Mam Brassica juncea Monitor (RTC Phase Owner)
+ * @brief ESP32 Firmware v2.8.0 — Rau Cai Mam Brassica juncea Monitor (Raspberry Pi Hotspot + Topic v2)
  *
  * @details
  * - Sensors: DHT11 (Moving Average 5), BH1750, ADS1115 (4ch single-ended), DS3231 RTC
  * - Actuator: Pump relay (active HIGH, GPIO 26), Light relay (GPIO 27)
- * - Protocol: MQTT → BBB (topic: cps/greenhouse/sensors)
+ * - Protocol: MQTT → Raspberry Pi broker (topic: cps/greenhouse/brassica_01/telemetry/sensors)
  * - Network: Tự động chuyển đổi giữa nhiều điểm truy cập WiFi (Multi-SSID) nếu rớt mạng.
  * - Resilience: Ring buffer 64 packets để lưu offline và tự động drain khi WiFi phục hồi.
  * - Phase owner: ESP32 đọc DS3231 RTC, tự tính Phase 1/2 theo planting_start_time,
- *   tự điều khiển đèn theo phase và gửi phase lên BBB.
+ *   tự điều khiển đèn theo phase và gửi phase lên Raspberry Pi Gateway.
  * - Time sync: WiFi có mạng -> NTP -> cập nhật DS3231 nếu lệch > 5 giây.
  */
 
@@ -51,7 +51,7 @@
 #endif
 
 /* ================================================================
-   CẤU HÌNH HỆ THỐNG WIIFI DẠNG MẢNG (MULTI-WIFI)
+   CẤU HÌNH WIFI — ESP32 KẾT NỐI RASPBERRY PI HOTSPOT
    ================================================================ */
 
 /**
@@ -64,12 +64,11 @@ typedef struct {
 
 /**
  * @brief Danh sách các mạng WiFi dự phòng. 
- * Hệ thống sẽ thử kết nối tuần tự từ trên xuống dưới.
+ * ESP32 kết nối vào hotspot Plant-Gateway do Raspberry Pi phát.
  */
 static const wifi_cred_t WIFI_NETWORKS[] = {
-    {"Phòng toàn trai đẹp", "aicungdeptrai<3"},
-    {"LUCAS",      "12345678"},
-    {"Truong Lung",    "12345678"}
+    /* Raspberry Pi hotspot: wlan0=192.168.4.1, Mosquitto=192.168.4.1:1883 */
+    {"Plant-Gateway", "Plant123456"}
 };
 #define WIFI_NETWORK_COUNT (sizeof(WIFI_NETWORKS) / sizeof(wifi_cred_t))
 #define WIFI_MAX_RETRY       3      /**< Số lần thử tối đa cho mỗi mạng trước khi đổi mạng khác */
@@ -84,27 +83,47 @@ static const wifi_cred_t WIFI_NETWORKS[] = {
 
 #define NODE_ID              "BRASSICA_JUNCEA_01"
 #define PLANT_NAME           "Rau Cải Mầm (Brassica juncea)"
-#define FW_VERSION           "2.7.0-rtc-nvs-phase-dt-stable"
+#define FW_VERSION           "2.8.0-rpi-hotspot-topic-v2"
 
 /* MQTT */
-#define MQTT_BROKER_URI      "mqtt://192.168.2.19"  /* IP hiện tại của BBB/Mosquitto */
+#define MQTT_BROKER_URI      "mqtt://192.168.4.1"   /* Raspberry Pi hotspot broker */
 #define MQTT_PORT            1883
 #define MQTT_KEEPALIVE_S     60
 #define MQTT_QOS             1
 #define MQTT_CLIENT_ID       "esp32_brassica_01"
 
-#define TOPIC_SENSOR         "cps/greenhouse/sensors"
-#define TOPIC_STATUS         "cps/greenhouse/status"
-#define TOPIC_ACTUATOR_STATE "cps/greenhouse/actuator/state"
+/* MQTT topic tree v2: cps/greenhouse/<node>/... */
+#define TOPIC_ROOT           "cps/greenhouse"
+#define NODE_TOPIC_ID        "brassica_01"
 
-/* BBB -> ESP32: luồng AUTO chính */
-#define TOPIC_CMD_PUMP       "cps/greenhouse/cmd/pump"
-#define TOPIC_CMD_LIGHT      "cps/greenhouse/cmd/light"      /* legacy/manual: chỉ log/ignore để tránh xung đột AUTO_RTC */
-#define TOPIC_CMD_PLANTING_START "cps/greenhouse/cmd/planting_start"
+/* ESP32 -> Broker */
+#define TOPIC_SENSOR \
+    TOPIC_ROOT "/" NODE_TOPIC_ID "/telemetry/sensors"
 
-/* BBB Influx Bridge -> ESP32: Digital Twin direct command */
-#define TOPIC_DT_CMD_PUMP    "cps/greenhouse/dt/cmd/pump"
-#define TOPIC_DT_CMD_LIGHT   "cps/greenhouse/dt/cmd/light"
+#define TOPIC_STATUS_ESP32 \
+    TOPIC_ROOT "/" NODE_TOPIC_ID "/status/esp32"
+
+#define TOPIC_ACTUATOR_STATE \
+    TOPIC_ROOT "/" NODE_TOPIC_ID "/state/actuator"
+
+/* Gateway -> Broker */
+#define TOPIC_STATUS_GATEWAY \
+    TOPIC_ROOT "/gateway/status"
+
+/* Raspberry Pi Gateway AI AUTO -> ESP32 */
+#define TOPIC_CMD_PUMP_AUTO \
+    TOPIC_ROOT "/" NODE_TOPIC_ID "/cmd/auto/pump"
+
+/* Unity/Web/Digital Twin DIRECT -> ESP32 */
+#define TOPIC_CMD_PUMP_DIRECT \
+    TOPIC_ROOT "/" NODE_TOPIC_ID "/cmd/direct/pump"
+
+#define TOPIC_CMD_LIGHT_DIRECT \
+    TOPIC_ROOT "/" NODE_TOPIC_ID "/cmd/direct/light"
+
+/* Config command */
+#define TOPIC_CMD_PLANTING_START \
+    TOPIC_ROOT "/" NODE_TOPIC_ID "/cmd/config/planting_start"
 
 /* GPIO & HW MUX */
 #define I2C_MASTER_SDA       21
@@ -159,7 +178,7 @@ static const ads111x_mux_t SOIL_MUX[SOIL_CH_COUNT] = {
 #define RTC_NTP_RETRY_MS          (10 * 60 * 1000)
 #define RTC_NTP_SYNC_PERIOD_MS    (24 * 60 * 60 * 1000)
 
-/* Local debug logs: hữu ích khi BBB/gateway chưa bật */
+/* Local debug logs: hữu ích khi Raspberry Pi Gateway/MQTT chưa bật */
 #define SENSOR_LOG_EVERY_N        1    /* 1 = log mỗi gói sensor, tương ứng ~5s */
 #define LIGHT_LOG_HEARTBEAT_S     30   /* log trạng thái đèn mỗi 30s nếu không đổi */
 #define OFFLINE_LOG_EVERY_N       5    /* khi MQTT mất, log buffer mỗi 5 packet */
@@ -247,7 +266,7 @@ typedef struct {
     float days_after_planting;
     char  phase_source[24];    /* ESP32_RTC / RTC_ERROR */
     char  pump_mode[24];       /* AI_AUTO / DIRECT_DT */
-    char  pump_reason[32];     /* BBB_AI_AUTO / DT_DIRECT / DIRECT_TIMEOUT_OFF */
+    char  pump_reason[32];     /* GATEWAY_AI_AUTO / DT_DIRECT / DIRECT_TIMEOUT_OFF */
     char  light_mode[24];      /* AUTO_RTC / DIRECT_DT / LEGACY_CMD */
     char  light_reason[32];    /* PHASE1_LOW_LIGHT / PHASE2_DAYLIGHT_SIM / DT_DIRECT */
     bool  dht11_ok;
@@ -953,7 +972,7 @@ static void publish_planting_status(const char *event, const char *cmd_id, const
         reason ? reason : "",
         now_iso);
 
-    if (len > 0) esp_mqtt_client_publish(s_mqtt, TOPIC_STATUS, payload, len, MQTT_QOS, 0);
+    if (len > 0) esp_mqtt_client_publish(s_mqtt, TOPIC_STATUS_ESP32, payload, len, MQTT_QOS, 0);
 }
 
 static bool planting_start_init_from_nvs_or_rtc(void) {
@@ -1082,19 +1101,19 @@ static void set_light_state(bool on, const char *mode, const char *reason) {
     }
 }
 
-static void handle_bbb_pump_command(esp_mqtt_event_handle_t ev) {
+static void handle_auto_pump_command(esp_mqtt_event_handle_t ev) {
     char payload[256];
     mqtt_data_to_cstr(ev, payload, sizeof(payload));
 
     if (pump_direct_active()) {
-        ESP_LOGW(TAG, "Ignore BBB cmd/pump while DT direct active: %s", payload);
+        ESP_LOGW(TAG, "Ignore Gateway auto pump while direct command active: %s", payload);
         return;
     }
 
     bool on = parse_on_off_command(payload, false);
-    set_pump_state(on, "AI_AUTO", "BBB_AI_AUTO");
-    ESP_LOGI(TAG, "BBB AUTO command: Pump -> %s", on ? "ON" : "OFF");
-    publish_actuator_state("BBB_CMD_PUMP");
+    set_pump_state(on, "AI_AUTO", "GATEWAY_AI_AUTO");
+    ESP_LOGI(TAG, "Gateway AUTO command: Pump -> %s", on ? "ON" : "OFF");
+    publish_actuator_state("GATEWAY_CMD_PUMP");
 }
 
 static void handle_dt_pump_command(esp_mqtt_event_handle_t ev) {
@@ -1112,7 +1131,7 @@ static void handle_dt_pump_command(esp_mqtt_event_handle_t ev) {
         s_pump_direct_until_us = esp_timer_get_time() + ((int64_t)duration_s * 1000000LL);
         set_pump_state(true, "DIRECT_DT", reason);
     } else {
-        s_pump_direct_until_us = esp_timer_get_time() + 2000000LL;  /* giữ quyền 2s để tránh BBB gửi ngược ngay */
+        s_pump_direct_until_us = esp_timer_get_time() + 2000000LL;  /* giữ quyền 2s để tránh Gateway gửi ngược ngay */
         set_pump_state(false, "DIRECT_DT", reason);
     }
 
@@ -1447,13 +1466,12 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
     switch ((esp_mqtt_event_id_t)id) {
         case MQTT_EVENT_CONNECTED:
             s_mqtt_connected = true;
-            esp_mqtt_client_subscribe(s_mqtt, TOPIC_CMD_PUMP,     MQTT_QOS);
-            esp_mqtt_client_subscribe(s_mqtt, TOPIC_CMD_LIGHT,    MQTT_QOS);
+            esp_mqtt_client_subscribe(s_mqtt, TOPIC_CMD_PUMP_AUTO, MQTT_QOS);
+            esp_mqtt_client_subscribe(s_mqtt, TOPIC_CMD_PUMP_DIRECT, MQTT_QOS);
+            esp_mqtt_client_subscribe(s_mqtt, TOPIC_CMD_LIGHT_DIRECT, MQTT_QOS);
             esp_mqtt_client_subscribe(s_mqtt, TOPIC_CMD_PLANTING_START, MQTT_QOS);
-            esp_mqtt_client_subscribe(s_mqtt, TOPIC_DT_CMD_PUMP,  MQTT_QOS);
-            esp_mqtt_client_subscribe(s_mqtt, TOPIC_DT_CMD_LIGHT, MQTT_QOS);
             ESP_LOGI(TAG,
-                     "MQTT kết nối %s:%d — sub: cmd/pump, cmd/light, planting_start, dt/cmd/pump, dt/cmd/light | buffer=%d/%d",
+                     "MQTT connected %s:%d — sub: auto/pump, direct/pump, direct/light, config/planting_start | buffer=%d/%d",
                      MQTT_BROKER_URI, MQTT_PORT, ring_count(), RING_BUF_SIZE);
             publish_actuator_state("MQTT_CONNECTED");
             break;
@@ -1464,22 +1482,16 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
             break;
         case MQTT_EVENT_ERROR:
             s_mqtt_connected = false;
-            ESP_LOGE(TAG, "MQTT_EVENT_ERROR — chưa kết nối được broker/gateway? broker=%s:%d | buffer=%d/%d",
+            ESP_LOGE(TAG, "MQTT_EVENT_ERROR — chưa kết nối được broker/Raspberry Pi Gateway? broker=%s:%d | buffer=%d/%d",
                      MQTT_BROKER_URI, MQTT_PORT, ring_count(), RING_BUF_SIZE);
             break;
         case MQTT_EVENT_DATA:
-            if (mqtt_topic_match(ev, TOPIC_CMD_PUMP)) {
-                handle_bbb_pump_command(ev);
-            } else if (mqtt_topic_match(ev, TOPIC_DT_CMD_PUMP)) {
+            if (mqtt_topic_match(ev, TOPIC_CMD_PUMP_AUTO)) {
+                handle_auto_pump_command(ev);
+            } else if (mqtt_topic_match(ev, TOPIC_CMD_PUMP_DIRECT)) {
                 handle_dt_pump_command(ev);
-            } else if (mqtt_topic_match(ev, TOPIC_DT_CMD_LIGHT)) {
+            } else if (mqtt_topic_match(ev, TOPIC_CMD_LIGHT_DIRECT)) {
                 handle_dt_light_command(ev, "DIRECT_DT");
-            } else if (mqtt_topic_match(ev, TOPIC_CMD_LIGHT)) {
-                /* Topic cũ/legacy. Không cho điều khiển đèn để tránh xung đột với AUTO_RTC.
-                 * Nếu broker còn retained message cũ, ESP32 chỉ log và bỏ qua.
-                 * Digital Twin/Web hãy dùng TOPIC_DT_CMD_LIGHT.
-                 */
-                ESP_LOGW(TAG, "Ignore legacy cmd/light. Use %s instead.", TOPIC_DT_CMD_LIGHT);
             } else if (mqtt_topic_match(ev, TOPIC_CMD_PLANTING_START)) {
                 handle_planting_start_command(ev);
             }
@@ -1683,7 +1695,7 @@ static void sensor_task(void *pv) {
  * - Nếu days_after_planting < DARK_PHASE_DAYS => Phase 1.
  * - Nếu days_after_planting >= DARK_PHASE_DAYS => Phase 2.
  * - ESP32 tự bật/tắt đèn theo phase và lịch RTC.
- * - BBB chỉ nhận phase trong JSON để chạy AI/ghi log, không gửi cmd/phase liên tục.
+ * - Gateway chỉ nhận phase trong JSON để chạy AI/ghi log, không gửi cmd/phase liên tục.
  */
 static void light_schedule_task(void *pv) {
     ESP_LOGI(TAG, "light_schedule_task running on core %d", xPortGetCoreID());
@@ -1777,7 +1789,7 @@ static void light_schedule_task(void *pv) {
  * @brief Task: Bảo vệ actuator direct mode và publish trạng thái relay thật.
  *
  * - Nếu Digital Twin bật bơm với duration_s, ESP32 tự tắt khi hết thời gian.
- * - Publish định kỳ actuator/state để BBB/Influx xác nhận trạng thái vật lý.
+ * - Publish định kỳ actuator/state để Gateway/Influx xác nhận trạng thái vật lý.
  */
 static void actuator_state_task(void *pv) {
     ESP_LOGI(TAG, "actuator_state_task running on core %d", xPortGetCoreID());
@@ -1864,7 +1876,7 @@ static void publish_task(void *pv) {
         } else {
             ring_push(json_buf);
             if ((s_step % OFFLINE_LOG_EVERY_N) == 0 || ring_count() == 1) {
-                ESP_LOGW(TAG, "OFFLINE step=%d — gateway/MQTT chưa sẵn sàng, lưu packet vào ring buffer %d/%d",
+                ESP_LOGW(TAG, "OFFLINE step=%d — Raspberry Pi Gateway/MQTT chưa sẵn sàng, lưu packet vào ring buffer %d/%d",
                          s_step, ring_count(), RING_BUF_SIZE);
             }
         }
@@ -1877,13 +1889,12 @@ static void publish_task(void *pv) {
 
 void app_main(void) {
     ESP_LOGI(TAG, "=== %s | %s v%s ===", PLANT_NAME, NODE_ID, FW_VERSION);
-    ESP_LOGI(TAG, "MQTT broker=%s:%d | client_id=%s | sensor=%s | auto_pump=%s | dt_pump=%s | dt_light=%s | actuator_state=%s",
-             MQTT_BROKER_URI, MQTT_PORT, MQTT_CLIENT_ID, TOPIC_SENSOR, TOPIC_CMD_PUMP,
-             TOPIC_DT_CMD_PUMP, TOPIC_DT_CMD_LIGHT, TOPIC_ACTUATOR_STATE);
-    ESP_LOGI(TAG, "Legacy topic %s is ignored; use %s for Digital Twin light direct",
-             TOPIC_CMD_LIGHT, TOPIC_DT_CMD_LIGHT);
-    ESP_LOGI(TAG, "Planting topic=%s | start=NVS after RTC/NTP check | dark_days=%.1f",
-             TOPIC_CMD_PLANTING_START, DARK_PHASE_DAYS);
+    ESP_LOGI(TAG, "MQTT broker=%s:%d | client_id=%s", MQTT_BROKER_URI, MQTT_PORT, MQTT_CLIENT_ID);
+    ESP_LOGI(TAG, "Topics v2 | sensor=%s | esp32_status=%s | actuator_state=%s",
+             TOPIC_SENSOR, TOPIC_STATUS_ESP32, TOPIC_ACTUATOR_STATE);
+    ESP_LOGI(TAG, "Topics v2 | auto_pump=%s | direct_pump=%s | direct_light=%s | planting=%s",
+             TOPIC_CMD_PUMP_AUTO, TOPIC_CMD_PUMP_DIRECT, TOPIC_CMD_LIGHT_DIRECT,
+             TOPIC_CMD_PLANTING_START);
 
     esp_err_t nvs_ret = nvs_flash_init();
     if (nvs_ret == ESP_ERR_NVS_NO_FREE_PAGES || nvs_ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
