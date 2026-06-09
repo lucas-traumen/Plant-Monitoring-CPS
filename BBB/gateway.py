@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """
-gateway.py — BBB Edge AI Gateway + InfluxDB Digital Twin Bridge
-===============================================================
+gateway.py — Raspberry Pi Edge AI Gateway + InfluxDB Digital Twin Bridge
+========================================================================
 
-Flow mới, không dùng SQL:
+Flow topic v2, không dùng SQL local:
 
 TELEMETRY:
-    ESP32 -> MQTT -> BBB Gateway -> InfluxDB sensors/status
+    ESP32 -> MQTT -> Raspberry Pi Gateway -> InfluxDB sensors/status
 
 AUTO CONTROL:
-    ESP32 sensor -> BBB Gateway Random Forest -> cps/greenhouse/cmd/pump -> ESP32
+    ESP32 sensor -> Raspberry Pi Gateway Random Forest -> cps/greenhouse/brassica_01/cmd/auto/pump -> ESP32
 
 DIGITAL TWIN CONTROL:
     Digital Twin/Web/Unity -> InfluxDB measurement dt
-    BBB Gateway poll dt PENDING -> MQTT cps/greenhouse/dt/cmd/pump/light hoặc cmd/planting_start -> ESP32
-    ESP32 -> cps/greenhouse/actuator/state -> BBB
-    BBB -> InfluxDB actuator + cmd/status
+    Raspberry Pi Gateway poll dt PENDING -> MQTT cmd/direct/pump|light hoặc cmd/config/planting_start -> ESP32
+    ESP32 -> cps/greenhouse/brassica_01/state/actuator -> Gateway
+    Gateway -> InfluxDB actuator + cmd/status
 
 Cài đặt:
     pip install paho-mqtt influxdb-client joblib pandas scikit-learn
@@ -65,7 +65,7 @@ BASE_DIR = Path(__file__).resolve().parent
 
 NODE_ID = "BRASSICA_JUNCEA_01"
 PLANT_NAME = "Rau Cải Mầm (Brassica juncea)"
-GW_VERSION = "3.4-influx-dt-planting-command"
+GW_VERSION = "3.5-rpi-hotspot-topic-v2"
 
 MODEL_PATH = BASE_DIR / "watering_random_forest_model.pkl"
 FEATURES_PATH = BASE_DIR / "model_features.json"
@@ -75,21 +75,29 @@ MQTT_BROKER = os.getenv("MQTT_BROKER", "127.0.0.1")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
 MQTT_KEEPALIVE = 60
 MQTT_QOS = 1
-MQTT_CLIENT_ID = "bbb_gateway_brassica_influx_bridge"
+MQTT_CLIENT_ID = "rpi_gateway_brassica_topic_v2"
 
-# ESP32 -> BBB / Digital Twin
-TOPIC_SENSOR = "cps/greenhouse/sensors"
-TOPIC_STATUS = "cps/greenhouse/status"
-TOPIC_ACTUATOR_STATE = "cps/greenhouse/actuator/state"
+# MQTT topic tree v2: cps/greenhouse/<node>/...
+TOPIC_ROOT = "cps/greenhouse"
+NODE_TOPIC_ID = "brassica_01"
 
-# BBB -> ESP32: AUTO control
-TOPIC_CMD_PUMP = "cps/greenhouse/cmd/pump"
-TOPIC_CMD_LIGHT = "cps/greenhouse/cmd/light"  # legacy/manual, không publish trong AUTO
-TOPIC_CMD_PLANTING_START = "cps/greenhouse/cmd/planting_start"
+# ESP32 -> Gateway / Web / Unity
+TOPIC_SENSOR = f"{TOPIC_ROOT}/{NODE_TOPIC_ID}/telemetry/sensors"
+TOPIC_STATUS_ESP32 = f"{TOPIC_ROOT}/{NODE_TOPIC_ID}/status/esp32"
+TOPIC_ACTUATOR_STATE = f"{TOPIC_ROOT}/{NODE_TOPIC_ID}/state/actuator"
 
-# BBB Influx Bridge -> ESP32: Digital Twin direct command
-TOPIC_DT_CMD_PUMP = "cps/greenhouse/dt/cmd/pump"
-TOPIC_DT_CMD_LIGHT = "cps/greenhouse/dt/cmd/light"
+# Gateway status
+TOPIC_STATUS_GATEWAY = f"{TOPIC_ROOT}/gateway/status"
+
+# Raspberry Pi Gateway AI AUTO -> ESP32
+TOPIC_CMD_PUMP_AUTO = f"{TOPIC_ROOT}/{NODE_TOPIC_ID}/cmd/auto/pump"
+
+# Unity/Web/Digital Twin DIRECT -> ESP32
+TOPIC_CMD_PUMP_DIRECT = f"{TOPIC_ROOT}/{NODE_TOPIC_ID}/cmd/direct/pump"
+TOPIC_CMD_LIGHT_DIRECT = f"{TOPIC_ROOT}/{NODE_TOPIC_ID}/cmd/direct/light"
+
+# Config command
+TOPIC_CMD_PLANTING_START = f"{TOPIC_ROOT}/{NODE_TOPIC_ID}/cmd/config/planting_start"
 
 # ── InfluxDB Cloud ───────────────────────────────────────────────────────────
 # Không hard-code token trong source code. Export biến môi trường trước khi chạy.
@@ -100,10 +108,10 @@ INFLUX_BUCKET_DEFAULT = "digital_twin_data"
 
 # InfluxDB measurements đúng theo thiết kế muốn thấy trong Data Explorer.
 # MQTT topic KHÔNG tự tạo bảng InfluxDB; chỉ Point("<measurement>") mới tạo bảng.
-MEAS_SENSORS = "sensors"      # cps/greenhouse/sensors + AI result
-MEAS_STATUS = "status"        # cps/greenhouse/status + latest JSON + planting_start ACK
-MEAS_ACTUATOR = "actuator"    # cps/greenhouse/actuator/state
-MEAS_CMD = "cmd"              # lệnh Gateway/Bridge gửi xuống ESP32 + SENT/DONE/ERROR
+MEAS_SENSORS = "sensors"      # telemetry/sensors + AI result
+MEAS_STATUS = "status"        # latest JSON + esp32/gateway status + planting_start ACK
+MEAS_ACTUATOR = "actuator"    # state/actuator
+MEAS_CMD = "cmd"              # lệnh Gateway gửi xuống ESP32 + SENT/DONE/ERROR
 MEAS_DT = "dt"                # queue lệnh Digital Twin/Web/Unity ghi vào InfluxDB
 
 
@@ -955,11 +963,11 @@ class GatewayApp:
 
     def start(self) -> None:
         self.log.info("═" * 72)
-        self.log.info(f"BBB Gateway v{GW_VERSION}")
+        self.log.info(f"Raspberry Pi Gateway v{GW_VERSION}")
         self.log.info(f"MQTT  : {self.broker}:{self.port}")
         self.log.info(f"Influx: {self.influx.url} org={self.influx.org} bucket={self.influx.bucket}")
         self.log.info(f"Model features: {self.controller.features}")
-        self.log.info("Flow: DT/Web -> InfluxDB dt_commands -> Gateway -> MQTT -> ESP32")
+        self.log.info("Flow: DT/Web/Unity -> InfluxDB dt_commands -> Gateway -> MQTT topic v2 -> ESP32")
         self.log.info("═" * 72)
 
         self.influx.start()
@@ -980,8 +988,8 @@ class GatewayApp:
         self.influx.stop()
         try:
             self.client.publish(
-                TOPIC_STATUS,
-                json.dumps({"node_id": NODE_ID, "gateway": "BBB", "status": "offline", "timestamp": utc_now_iso()}),
+                TOPIC_STATUS_GATEWAY,
+                json.dumps({"node_id": NODE_ID, "gateway": "Raspberry Pi", "gw_version": GW_VERSION, "status": "offline", "timestamp": utc_now_iso()}),
                 retain=True,
             )
             time.sleep(0.2)
@@ -1008,20 +1016,20 @@ class GatewayApp:
         if rc == 0:
             self.log.info("✅ MQTT connected.")
             client.subscribe(TOPIC_SENSOR, qos=MQTT_QOS)
-            client.subscribe(TOPIC_STATUS, qos=MQTT_QOS)
+            client.subscribe(TOPIC_STATUS_ESP32, qos=MQTT_QOS)
             client.subscribe(TOPIC_ACTUATOR_STATE, qos=MQTT_QOS)
             client.publish(
-                TOPIC_STATUS,
+                TOPIC_STATUS_GATEWAY,
                 json.dumps({
                     "node_id": NODE_ID,
-                    "gateway": "BBB",
+                    "gateway": "Raspberry Pi",
                     "gw_version": GW_VERSION,
                     "status": "online",
                     "timestamp": utc_now_iso(),
                 }, ensure_ascii=False),
                 retain=True,
             )
-            self.log.info(f"Subscribed: {TOPIC_SENSOR}, {TOPIC_STATUS}, {TOPIC_ACTUATOR_STATE}")
+            self.log.info(f"Subscribed: {TOPIC_SENSOR}, {TOPIC_STATUS_ESP32}, {TOPIC_ACTUATOR_STATE}")
         else:
             self.log.error(f"MQTT connect failed rc={rc}")
 
@@ -1041,7 +1049,7 @@ class GatewayApp:
         try:
             if msg.topic == TOPIC_SENSOR:
                 self._handle_sensor(raw)
-            elif msg.topic == TOPIC_STATUS:
+            elif msg.topic == TOPIC_STATUS_ESP32:
                 self._handle_status(raw)
             elif msg.topic == TOPIC_ACTUATOR_STATE:
                 self._handle_actuator_state(raw)
@@ -1090,7 +1098,7 @@ class GatewayApp:
             self.log.warning(f"⚠️ {alert}")
 
         if self._is_direct_active("pump"):
-            self.log.warning(f"SKIP AUTO {TOPIC_CMD_PUMP}: Digital Twin direct pump active.")
+            self.log.warning(f"SKIP AUTO {TOPIC_CMD_PUMP_AUTO}: Digital Twin direct pump active.")
         else:
             now = time.time()
             should_publish = (
@@ -1099,24 +1107,24 @@ class GatewayApp:
             )
 
             if should_publish:
-                result = self.client.publish(TOPIC_CMD_PUMP, pump_state, qos=MQTT_QOS)
+                result = self.client.publish(TOPIC_CMD_PUMP_AUTO, pump_state, qos=MQTT_QOS)
                 if result.rc == mqtt.MQTT_ERR_SUCCESS:
                     self.last_pump_sent = pump_state
                     self.last_pump_sent_at = now
-                    self.log.info(f"→ {TOPIC_CMD_PUMP}: {pump_state}")
+                    self.log.info(f"→ {TOPIC_CMD_PUMP_AUTO}: {pump_state}")
                     try:
                         self.influx.write_command_event(
                             "auto_pump",
                             "pump",
                             "SENT",
-                            f"topic={TOPIC_CMD_PUMP}; state={pump_state}; reason={pump_reason}",
+                            f"topic={TOPIC_CMD_PUMP_AUTO}; state={pump_state}; reason={pump_reason}",
                         )
                     except Exception as exc:
                         self.log.debug(f"[InfluxDB] auto cmd event write skipped: {exc}")
                 else:
-                    self.log.error(f"→ {TOPIC_CMD_PUMP} FAILED rc={result.rc}")
+                    self.log.error(f"→ {TOPIC_CMD_PUMP_AUTO} FAILED rc={result.rc}")
             else:
-                self.log.debug(f"Skip duplicate {TOPIC_CMD_PUMP}: {pump_state}")
+                self.log.debug(f"Skip duplicate {TOPIC_CMD_PUMP_AUTO}: {pump_state}")
 
         self.influx.enqueue_telemetry(payload)
         try:
@@ -1264,7 +1272,7 @@ class GatewayApp:
         default_s = 10 if target == "pump" else 300
         duration_s = clamp_duration(cmd.get("duration_s"), default_s=default_s, max_s=max_s)
 
-        topic = TOPIC_DT_CMD_PUMP if target == "pump" else TOPIC_DT_CMD_LIGHT
+        topic = TOPIC_CMD_PUMP_DIRECT if target == "pump" else TOPIC_CMD_LIGHT_DIRECT
         payload = {
             "id": command_id,
             "command_id": command_id,
@@ -1363,7 +1371,7 @@ def handle_signal(sig, frame):
 def main() -> None:
     global _app
 
-    parser = argparse.ArgumentParser(description="BBB Gateway + InfluxDB Digital Twin Bridge")
+    parser = argparse.ArgumentParser(description="Raspberry Pi Gateway + InfluxDB Digital Twin Bridge")
     parser.add_argument("--broker", default=MQTT_BROKER)
     parser.add_argument("--port", type=int, default=MQTT_PORT)
     parser.add_argument("--model", default=str(MODEL_PATH))

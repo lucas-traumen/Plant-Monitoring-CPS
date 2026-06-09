@@ -87,7 +87,7 @@ static const wifi_cred_t WIFI_NETWORKS[] = {
 #define FW_VERSION           "2.7.0-rtc-nvs-phase-dt-stable"
 
 /* MQTT */
-#define MQTT_BROKER_URI      "mqtt://192.168.2.12"  /* IP hiện tại của BBB/Mosquitto */
+#define MQTT_BROKER_URI      "mqtt://192.168.2.19"  /* IP hiện tại của BBB/Mosquitto */
 #define MQTT_PORT            1883
 #define MQTT_KEEPALIVE_S     60
 #define MQTT_QOS             1
@@ -184,7 +184,7 @@ static const ads111x_mux_t SOIL_MUX[SOIL_CH_COUNT] = {
  * - Reset/mất điện/flash thường: NVS còn, không reset mốc.
  * - Bắt đầu lứa mới: gửi MQTT TOPIC_CMD_PLANTING_START action=SET_NOW/SET_EPOCH/CLEAR.
  */
-#define DARK_PHASE_DAYS      2.0f
+#define DARK_PHASE_DAYS     2.0f
 #define NVS_NS_PLANTING     "planting"
 #define NVS_KEY_START_EPOCH "start_epoch"
 #define NVS_KEY_LAST_CMD_ID "last_cmd"
@@ -194,8 +194,8 @@ static const ads111x_mux_t SOIL_MUX[SOIL_CH_COUNT] = {
 #define CORE_NET            0
 #define CORE_APP            1
 
-#define LIGHT_ON_HOUR_UTC7   6
-#define LIGHT_OFF_HOUR_UTC7  20
+#define LIGHT_ON_HOUR_UTC7   8
+#define LIGHT_OFF_HOUR_UTC7  16
 
 /* ADS1115 Calibration */
 #define SOIL_V_DRY           3.0f

@@ -11,28 +11,94 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from influxdb_client import InfluxDBClient
-
+from pathlib import Path
 
 # ======================================================
-# LOAD ENV
+# LOAD ENV / MANUAL CONFIG
 # ======================================================
 
 load_dotenv()
 
-# Dùng tên biến giống BBB/gateway.py trước.
-# Vẫn hỗ trợ thêm dạng INFLUXDB_* nếu sau này cần.
-INFLUX_URL = os.getenv("INFLUX_URL") or os.getenv("INFLUXDB_URL")
-INFLUX_TOKEN = os.getenv("INFLUX_TOKEN") or os.getenv("INFLUXDB_TOKEN")
-INFLUX_ORG = os.getenv("INFLUX_ORG") or os.getenv("INFLUXDB_ORG")
-INFLUX_BUCKET = os.getenv("INFLUX_BUCKET") or os.getenv("INFLUXDB_BUCKET")
+BASE_DIR = Path(__file__).resolve().parent
 
-# Measurement theo luồng gateway.py
+NODE_ID = "BRASSICA_JUNCEA_01"
+PLANT_NAME = "Rau Cải Mầm (Brassica juncea)"
+GW_VERSION = "3.4-influx-dt-planting-command"
+
+MODEL_PATH = BASE_DIR / "watering_random_forest_model.pkl"
+FEATURES_PATH = BASE_DIR / "model_features.json"
+CONFIG_PATH = BASE_DIR / "controller_config.json"
+
+# ======================================================
+# MQTT CONFIG
+# ======================================================
+
+MQTT_BROKER = os.getenv("MQTT_BROKER", "127.0.0.1")
+MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
+MQTT_KEEPALIVE = 60
+MQTT_QOS = 1
+MQTT_CLIENT_ID = "bbb_gateway_brassica_influx_bridge"
+
+# ESP32 -> BBB / Digital Twin
+TOPIC_SENSOR = "cps/greenhouse/sensors"
+TOPIC_STATUS = "cps/greenhouse/status"
+TOPIC_ACTUATOR_STATE = "cps/greenhouse/actuator/state"
+
+# BBB -> ESP32: AUTO control
+TOPIC_CMD_PUMP = "cps/greenhouse/cmd/pump"
+TOPIC_CMD_LIGHT = "cps/greenhouse/cmd/light"
+TOPIC_CMD_PLANTING_START = "cps/greenhouse/cmd/planting_start"
+
+# BBB Influx Bridge -> ESP32: Digital Twin direct command
+TOPIC_DT_CMD_PUMP = "cps/greenhouse/dt/cmd/pump"
+TOPIC_DT_CMD_LIGHT = "cps/greenhouse/dt/cmd/light"
+
+# ======================================================
+# INFLUXDB CONFIG
+# ======================================================
+# Ưu tiên đọc từ .env.
+# Nếu .env không có thì dùng giá trị nhập thủ công bên dưới.
+
+INFLUX_URL_DEFAULT = "https://us-east-1-1.aws.cloud2.influxdata.com"
+INFLUX_TOKEN_DEFAULT = "6pSuWQaFLlWq6iRVfaRYEMwIO1DDEChBsG42HdDx5En6fuqpUx95j3xswbVNrcWxRrs_sizN6XXESjzNqcHzJA=="
+INFLUX_ORG_DEFAULT = "DEV_TEAM"
+INFLUX_BUCKET_DEFAULT = "digital_twin_data"
+
+INFLUX_URL = (
+    os.getenv("INFLUX_URL")
+    or os.getenv("INFLUXDB_URL")
+    or INFLUX_URL_DEFAULT
+)
+
+INFLUX_TOKEN = (
+    os.getenv("INFLUX_TOKEN")
+    or os.getenv("INFLUXDB_TOKEN")
+    or INFLUX_TOKEN_DEFAULT
+)
+
+INFLUX_ORG = (
+    os.getenv("INFLUX_ORG")
+    or os.getenv("INFLUXDB_ORG")
+    or INFLUX_ORG_DEFAULT
+)
+
+INFLUX_BUCKET = (
+    os.getenv("INFLUX_BUCKET")
+    or os.getenv("INFLUXDB_BUCKET")
+    or INFLUX_BUCKET_DEFAULT
+)
+
+# ======================================================
+# INFLUXDB MEASUREMENTS
+# ======================================================
+# MQTT topic không tự tạo bảng InfluxDB.
+# Measurement được tạo theo Point("<measurement>").
+
 MEAS_SENSORS = os.getenv("MEAS_SENSORS", "sensors")
 MEAS_STATUS = os.getenv("MEAS_STATUS", "status")
 MEAS_ACTUATOR = os.getenv("MEAS_ACTUATOR", "actuator")
 MEAS_CMD = os.getenv("MEAS_CMD", "cmd")
 MEAS_DT = os.getenv("MEAS_DT", "dt")
-
 
 # ======================================================
 # FASTAPI APP
