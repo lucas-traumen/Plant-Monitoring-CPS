@@ -887,6 +887,7 @@
 		)
 		(embedded_fonts no)
 		(model "E:/IoT_Lab/3D/Connector/XH_2.54/Thru Vertical/JST - XH - Thru (V) - 4Pin - 2.54mm.stp"
+			(hide yes)
 			(offset
 				(xyz -0.1 0 0)
 			)
@@ -2940,6 +2941,7 @@
 		)
 		(embedded_fonts no)
 		(model "E:/IoT_Lab/3D/Connector/XH_2.54/Thru Vertical/JST - XH - Thru (V) - 4Pin - 2.54mm.stp"
+			(hide yes)
 			(offset
 				(xyz -0.1 0 0)
 			)
@@ -3613,6 +3615,7 @@
 		)
 		(embedded_fonts no)
 		(model "E:/IoT_Lab/3D/Connector/XH_2.54/Thru Vertical/JST - XH - Thru (V) - 4Pin - 2.54mm.stp"
+			(hide yes)
 			(offset
 				(xyz -0.1 0 0)
 			)
@@ -4261,6 +4264,7 @@
 		)
 		(embedded_fonts no)
 		(model "E:/IoT_Lab/3D/Connector/XH_2.54/Thru Vertical/JST - XH - Thru (V) - 4Pin - 2.54mm.stp"
+			(hide yes)
 			(offset
 				(xyz -0.1 0 0)
 			)

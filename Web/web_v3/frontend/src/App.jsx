@@ -15,6 +15,10 @@ const API_BASE =
   import.meta.env.VITE_API_BASE ||
   `${window.location.protocol}//${window.location.hostname}:8000`;
 
+const WS_BASE =
+  import.meta.env.VITE_WS_BASE ||
+  `${window.location.protocol === "https:" ? "wss" : "ws"}://${window.location.hostname}:8000`;
+
 function formatNumber(value, digits = 1) {
   if (value === null || value === undefined || Number.isNaN(Number(value))) {
     return "N/A";
@@ -135,7 +139,7 @@ function CommandPanel({ onCommand, commandBusy }) {
       <div className="panel-header">
         <div>
           <h2>Điều khiển Web</h2>
-          <p>Web ghi lệnh vào InfluxDB measurement dt. Gateway sẽ bridge xuống MQTT topic v2 cho ESP32.</p>
+          <p>Web gửi lệnh tới Backend. Backend publish MQTT xuống ESP32 ngay và đồng thời ghi log vào InfluxDB.</p>
         </div>
       </div>
 
@@ -217,10 +221,27 @@ function App() {
   const [commandMessage, setCommandMessage] = useState("");
   const [commandBusy, setCommandBusy] = useState(false);
   const [lastUpdate, setLastUpdate] = useState("");
+  const [wsStatus, setWsStatus] = useState("CONNECTING");
+  const [realtimeCount, setRealtimeCount] = useState(0);
 
   function buildQueryString() {
     if (selectedDate) return `date=${selectedDate}`;
     return `minutes=${minutes}`;
+  }
+
+
+  function applyLatestPatch(patch) {
+    if (!patch || typeof patch !== "object") return;
+    setLatest((prev) => ({ ...(prev || {}), ...patch }));
+
+    if (patch.sensors) {
+      setSensorHistory((prev) => {
+        const next = [...prev, patch.sensors];
+        return next.slice(-300);
+      });
+    }
+    setRealtimeCount((v) => v + 1);
+    setLastUpdate(new Date().toLocaleString());
   }
 
   async function loadDashboardData() {
@@ -296,7 +317,7 @@ function App() {
         throw new Error(data.detail || `Command API error: ${response.status}`);
       }
 
-      setCommandMessage(`Queued ${data.target}: ${data.command_id}`);
+      setCommandMessage(`${data.status || "SENT"} ${data.target}: ${data.command_id}`);
       await loadDashboardData();
     } catch (err) {
       setCommandMessage(`Lỗi command: ${err.message}`);
@@ -306,8 +327,48 @@ function App() {
   }
 
   useEffect(() => {
+    let ws = null;
+    let stopped = false;
+    let reconnectTimer = null;
+
+    function connectWs() {
+      if (stopped) return;
+      setWsStatus("CONNECTING");
+      ws = new WebSocket(`${WS_BASE}/ws/realtime`);
+
+      ws.onopen = () => setWsStatus("ONLINE");
+      ws.onclose = () => {
+        setWsStatus("OFFLINE");
+        if (!stopped) reconnectTimer = setTimeout(connectWs, 2000);
+      };
+      ws.onerror = () => setWsStatus("ERROR");
+      ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+          if (msg.latest) applyLatestPatch(msg.latest);
+          if (msg.type === "planting_start_ack" || msg.type === "command_sent") {
+            const cid = msg.command_id || msg.data?.command_id || "";
+            const st = msg.status || msg.data?.status || msg.latest?.command_event?.status || "";
+            if (cid) setCommandMessage(`${msg.type}: ${cid} ${st}`);
+          }
+        } catch (err) {
+          console.warn("WebSocket parse error", err);
+        }
+      };
+    }
+
+    connectWs();
+    return () => {
+      stopped = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (ws) ws.close();
+    };
+  }, []);
+
+  useEffect(() => {
     loadDashboardData();
-    const timer = setInterval(loadDashboardData, 5000);
+    // WebSocket là realtime chính; polling chỉ là fallback nhẹ để khôi phục khi WS rớt.
+    const timer = setInterval(loadDashboardData, 30000);
     return () => clearInterval(timer);
   }, [minutes, selectedDate]);
 
@@ -406,18 +467,17 @@ function App() {
 
         <div className="sidebar-footer">
           <span className="live-dot" />
-          <span>{selectedDate ? `Viewing: ${selectedDate}` : "Realtime polling: 5s"}</span>
+          <span>{selectedDate ? `Viewing: ${selectedDate}` : `WebSocket: ${wsStatus} • events ${realtimeCount}`}</span>
         </div>
       </aside>
 
       <main className="main-content">
         <header className="top-header">
           <div>
-            <div className="eyebrow">ESP32 + MQTT topic v2 + Pi Gateway + InfluxDB</div>
+            <div className="eyebrow">ESP32 + MQTT realtime + Pi Gateway + WebSocket + InfluxDB history</div>
             <h1>Plant Monitoring CPS Dashboard</h1>
             <p>
-              Dashboard đọc dữ liệu thật từ InfluxDB. Các nút điều khiển ghi lệnh vào measurement dt,
-              sau đó gateway bridge xuống MQTT topic v2 cho ESP32.
+              Dashboard lấy log cũ từ InfluxDB và nhận dữ liệu mới qua WebSocket. Các nút điều khiển gửi lệnh tới Backend để publish MQTT ngay xuống ESP32, đồng thời ghi log vào InfluxDB.
             </p>
           </div>
           <div className="header-status-card">
@@ -431,6 +491,7 @@ function App() {
 
         <section className="summary-grid">
           <div className="summary-card"><span>Last dashboard update</span><strong>{lastUpdate || "N/A"}</strong></div>
+          <div className="summary-card"><span>Realtime WebSocket</span><strong>{wsStatus} ({realtimeCount})</strong></div>
           <div className="summary-card"><span>Latest sensor time</span><strong>{formatTime(sensors?._time)}</strong></div>
           <div className="summary-card"><span>Rows loaded</span><strong>{sensorHistory.length}</strong></div>
           <div className="summary-card"><span>View mode</span><strong>{selectedDate ? `Date: ${selectedDate}` : `Recent: ${minutes}m`}</strong></div>
@@ -448,7 +509,7 @@ function App() {
           <div className="panel-header">
             <div>
               <h2>Dữ liệu cảm biến mới nhất</h2>
-              <p>Dữ liệu lấy từ measurement sensors trong InfluxDB.</p>
+              <p>Dữ liệu realtime từ WebSocket; khi mở lại sẽ fallback/query từ InfluxDB.</p>
             </div>
           </div>
           <div className="metric-grid">

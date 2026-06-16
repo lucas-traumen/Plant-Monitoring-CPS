@@ -39,6 +39,8 @@ import sys
 import threading
 import time
 import uuid
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -65,7 +67,7 @@ BASE_DIR = Path(__file__).resolve().parent
 
 NODE_ID = "BRASSICA_JUNCEA_01"
 PLANT_NAME = "Rau Cải Mầm (Brassica juncea)"
-GW_VERSION = "3.6-filter-fusion-planting-sync"
+GW_VERSION = "3.7.0-realtime-bridge-latest-db"
 
 MODEL_PATH = BASE_DIR / "watering_random_forest_model.pkl"
 FEATURES_PATH = BASE_DIR / "model_features.json"
@@ -112,7 +114,15 @@ MEAS_SENSORS = "sensors"      # telemetry/sensors + AI result
 MEAS_STATUS = "status"        # latest JSON + esp32/gateway status + planting_start ACK
 MEAS_ACTUATOR = "actuator"    # state/actuator
 MEAS_CMD = "cmd"              # lệnh Gateway gửi xuống ESP32 + SENT/DONE/ERROR
-MEAS_DT = "dt"                # queue lệnh Digital Twin/Web/Unity ghi vào InfluxDB
+MEAS_DT = "dt"                # queue/log lệnh Digital Twin/Web/Unity ghi vào InfluxDB
+
+# Realtime bridge: Gateway nhận MQTT từ ESP32 thì vừa ghi InfluxDB, vừa đẩy ngay cho Backend.
+REALTIME_ENABLED = os.getenv("REALTIME_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+REALTIME_BACKEND_URL = os.getenv("REALTIME_BACKEND_URL", "http://127.0.0.1:8000").rstrip("/")
+REALTIME_INGEST_PATH = os.getenv("REALTIME_INGEST_PATH", "/api/realtime/ingest")
+REALTIME_INGEST_TOKEN = os.getenv("REALTIME_INGEST_TOKEN", "")
+REALTIME_TIMEOUT_S = float(os.getenv("REALTIME_TIMEOUT_S", "0.7"))
+REALTIME_QUEUE_MAX = int(os.getenv("REALTIME_QUEUE_MAX", "300"))
 
 
 WRITE_PRECISION_SECONDS = getattr(WritePrecision, "S", None) or getattr(WritePrecision, "SECONDS")
@@ -543,7 +553,8 @@ from(bucket: "{self.bucket}")
   |> filter(fn: (r) => r._measurement == "{MEAS_DT}")
   |> filter(fn: (r) => r.status == "PENDING")
   |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
-  |> sort(columns: ["_time"], desc: false)
+  |> group()
+  |> sort(columns: ["_time"], desc: true)
   |> limit(n: {int(limit)})
 """
         tables = self.query_api.query(flux, org=self.org)
@@ -583,6 +594,7 @@ from(bucket: "{self.bucket}")
   |> filter(fn: (r) => r._measurement == "{MEAS_DT}")
   |> filter(fn: (r) => r.target == "planting_start")
   |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
+  |> group()
   |> sort(columns: ["_time"], desc: true)
   |> limit(n: 50)
 """
@@ -613,6 +625,80 @@ from(bucket: "{self.bucket}")
                     }
         return None
 
+
+
+# =============================================================================
+# REALTIME BRIDGE TO FASTAPI BACKEND
+# =============================================================================
+
+class RealtimeBridge:
+    """Non-blocking HTTP bridge: Gateway -> FastAPI -> WebSocket clients.
+
+    Realtime path should not wait for InfluxDB query. Gateway posts event snapshots
+    to Backend; Backend broadcasts them to Web/Unity over WebSocket.
+    If Backend is offline, Gateway only drops realtime events; InfluxDB logging still runs.
+    """
+
+    def __init__(self, log: logging.Logger):
+        self.log = log
+        self.enabled = REALTIME_ENABLED
+        self.url = f"{REALTIME_BACKEND_URL}{REALTIME_INGEST_PATH}"
+        self.token = REALTIME_INGEST_TOKEN
+        self.queue: queue.Queue[dict] = queue.Queue(maxsize=REALTIME_QUEUE_MAX)
+        self.stop_event = threading.Event()
+        self.thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        if not self.enabled:
+            self.log.warning("Realtime bridge disabled by REALTIME_ENABLED=0")
+            return
+        self.thread = threading.Thread(target=self._worker, daemon=True)
+        self.thread.start()
+        self.log.info(f"Realtime bridge enabled: POST {self.url}")
+
+    def stop(self) -> None:
+        self.stop_event.set()
+
+    def publish(self, event_type: str, data: dict, topic: str = "", extra: Optional[dict] = None) -> None:
+        if not self.enabled:
+            return
+        event = {
+            "type": event_type,
+            "source": "gateway",
+            "gateway_version": GW_VERSION,
+            "node_id": data.get("node_id", NODE_ID) if isinstance(data, dict) else NODE_ID,
+            "topic": topic,
+            "timestamp": utc_now_iso(),
+            "data": data,
+        }
+        if extra:
+            event.update(extra)
+        try:
+            self.queue.put_nowait(event)
+        except queue.Full:
+            self.log.warning("Realtime queue full; drop event type=%s", event_type)
+
+    def _worker(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                event = self.queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                body = json.dumps(event, ensure_ascii=False).encode("utf-8")
+                headers = {"Content-Type": "application/json"}
+                if self.token:
+                    headers["X-Realtime-Token"] = self.token
+                req = urllib.request.Request(self.url, data=body, headers=headers, method="POST")
+                with urllib.request.urlopen(req, timeout=REALTIME_TIMEOUT_S) as resp:
+                    if resp.status >= 300:
+                        self.log.debug("Realtime POST status=%s", resp.status)
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                self.log.debug("Realtime POST failed: %s", exc)
+            except Exception as exc:
+                self.log.debug("Realtime worker error: %s", exc)
+            finally:
+                self.queue.task_done()
 
 # =============================================================================
 # AI CONTROLLER
@@ -1045,6 +1131,7 @@ class GatewayApp:
         self.log = setup_logging(debug)
         self.cfg = GatewayConfig.from_json(config_path)
         self.influx = InfluxManager(self.log)
+        self.realtime = RealtimeBridge(self.log)
 
         model, features = load_model_and_features(model_path, features_path)
         self.controller = EdgeAIWateringController(model, features, self.cfg)
@@ -1098,10 +1185,11 @@ class GatewayApp:
         self.log.info(f"MQTT  : {self.broker}:{self.port}")
         self.log.info(f"Influx: {self.influx.url} org={self.influx.org} bucket={self.influx.bucket}")
         self.log.info(f"Model features: {self.controller.features}")
-        self.log.info("Flow: DT/Web/Unity -> InfluxDB dt_commands -> Gateway -> MQTT topic v2 -> ESP32")
+        self.log.info("Flow realtime: ESP32 -> MQTT -> Gateway -> Backend/WebSocket; storage: Gateway -> InfluxDB")
         self.log.info("═" * 72)
 
         self.influx.start()
+        self.realtime.start()
         self._connect_mqtt()
 
         try:
@@ -1116,6 +1204,7 @@ class GatewayApp:
 
     def stop(self) -> None:
         self.stop_event.set()
+        self.realtime.stop()
         self.influx.stop()
         try:
             self.client.publish(
@@ -1161,6 +1250,7 @@ class GatewayApp:
                 retain=True,
             )
             self.log.info(f"Subscribed: {TOPIC_SENSOR}, {TOPIC_STATUS_ESP32}, {TOPIC_ACTUATOR_STATE}")
+            self.realtime.publish("gateway_status", {"node_id": NODE_ID, "gateway": "Raspberry Pi", "gw_version": GW_VERSION, "status": "online", "timestamp": utc_now_iso()}, topic=TOPIC_STATUS_GATEWAY)
         else:
             self.log.error(f"MQTT connect failed rc={rc}")
 
@@ -1259,12 +1349,14 @@ class GatewayApp:
             else:
                 self.log.debug(f"Skip duplicate {TOPIC_CMD_PUMP_AUTO}: {pump_state}")
 
+        self.influx.enqueue_telemetry(payload)
         try:
-            self.influx.write_telemetry(payload)
             self.influx.write_latest_state("telemetry", payload)
-            self.log.info("[InfluxDB] telemetry direct write OK")
         except Exception as exc:
-            self.log.error(f"[InfluxDB] telemetry direct write error: {exc}")
+            self.log.debug(f"latest_state telemetry write skipped: {exc}")
+
+        # Realtime path: không chờ Unity/Web query lại InfluxDB.
+        self.realtime.publish("sensor", payload, topic=TOPIC_SENSOR)
 
     def _handle_actuator_state(self, raw: dict) -> None:
         state = parse_actuator_state(raw)
@@ -1297,6 +1389,7 @@ class GatewayApp:
             f"[ACTUATOR_STATE] pump={pump_state}/{state['pump']['mode']} "
             f"light={light_state}/{state['light']['mode']}"
         )
+        self.realtime.publish("actuator_state", state, topic=TOPIC_ACTUATOR_STATE)
 
     def _handle_status(self, raw: dict) -> None:
         """Handle ESP32 status ACKs, especially planting_start command acknowledgements."""
@@ -1304,6 +1397,8 @@ class GatewayApp:
             self.influx.write_latest_state("status", raw)
         except Exception as exc:
             self.log.debug(f"latest_state status write skipped: {exc}")
+
+        self.realtime.publish("esp32_status", raw, topic=TOPIC_STATUS_ESP32)
 
         command_id = str(raw.get("command_id") or raw.get("id") or "").strip()
         event = str(raw.get("event") or "").strip()
@@ -1376,6 +1471,7 @@ class GatewayApp:
             f"[PLANTING_ACK] command_id={command_id} event={event} "
             f"status={event_status} start={raw.get('planting_start_epoch')}"
         )
+        self.realtime.publish("planting_start_ack", raw, topic=TOPIC_STATUS_ESP32, extra={"command_id": command_id, "status": event_status})
 
     # -------------------------------------------------------------------------
     # InfluxDB dt_commands -> MQTT dt/cmd bridge
@@ -1393,6 +1489,17 @@ class GatewayApp:
                 for cmd in commands:
                     command_id = cmd["command_id"]
                     target = str(cmd.get("target") or "").lower()
+
+                    # InfluxDB dt is append-only. Older planting_start rows may remain PENDING;
+                    # do not replay them after a newer Unity/Web Start exists.
+                    if self._planting_command_is_stale(cmd):
+                        try:
+                            self.influx.write_command_event(command_id, target, "SUPERSEDED", "stale planting_start ignored; newer desired command exists")
+                        except Exception:
+                            pass
+                        self.processed_command_ids.add(command_id)
+                        self.log.warning(f"[PLANTING_SYNC] skip stale command_id={command_id} epoch={cmd.get('planting_start_epoch')} desired={self.desired_planting_start_epoch}")
+                        continue
 
                     if command_id in self.processed_command_ids:
                         continue
@@ -1452,6 +1559,7 @@ class GatewayApp:
             self.sent_commands[command_id] = {"target": target, "state": state, "duration_s": duration_s}
             self._set_direct_active(target, duration_s + 2)
             self.log.warning(f"[INFLUX_BRIDGE] SENT id={command_id} -> {topic}: {state} duration={duration_s}s")
+            self.realtime.publish("command_sent", payload, topic=topic, extra={"command_id": command_id, "target": target, "status": "SENT"})
         else:
             self.influx.write_command_event(command_id, target, "ERROR", f"mqtt publish rc={result.rc}")
 
@@ -1511,6 +1619,7 @@ class GatewayApp:
                 self.desired_planting_start_epoch = int(payload["planting_start_epoch"])
                 self.desired_planting_start_command_id = command_id
             self.log.warning(f"[INFLUX_BRIDGE] SENT id={command_id} -> {TOPIC_CMD_PLANTING_START}: {action}")
+            self.realtime.publish("command_sent", payload, topic=TOPIC_CMD_PLANTING_START, extra={"command_id": command_id, "target": "planting_start", "status": "SENT"})
         else:
             self.influx.write_command_event(command_id, "planting_start", "ERROR", f"mqtt publish rc={result.rc}")
             self.processed_command_ids.add(command_id)
@@ -1546,6 +1655,35 @@ class GatewayApp:
         self.desired_planting_start_epoch = epoch
         self.desired_planting_start_command_id = command_id
         self._reconcile_planting_start_if_needed("db_refresh")
+
+    def _planting_command_is_stale(self, cmd: dict) -> bool:
+        """Return True if a pending planting_start command is older than the latest DB desired state.
+
+        InfluxDB is append-only, so older dt rows remain PENDING forever. Without this guard,
+        Gateway can replay an old start_epoch and force ESP32 NVS backward.
+        """
+        target = str(cmd.get("target") or "").lower()
+        if target != "planting_start":
+            return False
+
+        action = str(cmd.get("action") or "").upper()
+        command_id = str(cmd.get("command_id") or "")
+
+        # GET is harmless and should be allowed. CLEAR is only allowed when it is the latest desired command.
+        if action == "GET":
+            return False
+
+        desired_cmd = str(self.desired_planting_start_command_id or "")
+        desired_epoch = int(self.desired_planting_start_epoch or 0)
+        epoch = safe_int(cmd.get("planting_start_epoch"), 0)
+
+        if desired_cmd and command_id != desired_cmd:
+            return True
+
+        if action == "SET_EPOCH" and desired_epoch > 0 and epoch > 0 and epoch != desired_epoch:
+            return True
+
+        return False
 
     def _reconcile_planting_start_if_needed(self, source: str) -> None:
         desired = int(self.desired_planting_start_epoch or 0)
@@ -1634,7 +1772,7 @@ def main() -> None:
     parser.add_argument("--model", default=str(MODEL_PATH))
     parser.add_argument("--features", default=str(FEATURES_PATH))
     parser.add_argument("--config", default=str(CONFIG_PATH))
-    parser.add_argument("--poll-commands-s", type=float, default=1.0)
+    parser.add_argument("--poll-commands-s", type=float, default=float(os.getenv("POLL_COMMANDS_S", "1.0")))
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--insert-test", choices=["pump_on", "pump_off", "light_on", "light_off", "planting_start_now", "planting_start_get", "planting_start_clear"])
 
