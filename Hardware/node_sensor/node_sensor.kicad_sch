@@ -3239,6 +3239,12 @@
 		)
 	)
 	(junction
+		(at 106.68 147.32)
+		(diameter 0)
+		(color 0 0 0 0)
+		(uuid "3340aa0a-2de7-49dd-97f1-1b50f268b50c")
+	)
+	(junction
 		(at 52.07 20.32)
 		(diameter 0)
 		(color 0 0 0 0)
@@ -3273,6 +3279,12 @@
 		(diameter 0)
 		(color 0 0 0 0)
 		(uuid "d446c244-eea9-4f90-9fe4-94c07167d6e3")
+	)
+	(junction
+		(at 100.33 151.13)
+		(diameter 0)
+		(color 0 0 0 0)
+		(uuid "e0534a29-835b-476a-8ca4-93d2158e1429")
 	)
 	(junction
 		(at 45.72 34.29)
@@ -3432,6 +3444,16 @@
 	)
 	(wire
 		(pts
+			(xy 100.33 143.51) (xy 105.41 143.51)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "01cceb13-9d16-42cb-85b4-29464aa97e6f")
+	)
+	(wire
+		(pts
 			(xy 22.86 34.29) (xy 30.48 34.29)
 		)
 		(stroke
@@ -3542,6 +3564,16 @@
 	)
 	(wire
 		(pts
+			(xy 100.33 151.13) (xy 109.22 151.13)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "371d80a8-a2cc-4574-9c5c-04df0d22d359")
+	)
+	(wire
+		(pts
 			(xy 21.59 133.35) (xy 25.4 133.35)
 		)
 		(stroke
@@ -3559,6 +3591,16 @@
 			(type default)
 		)
 		(uuid "3e5a0368-a291-4d54-b1b1-e7cd1e5a8a3b")
+	)
+	(wire
+		(pts
+			(xy 105.41 147.32) (xy 106.68 147.32)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "3fc4b6ee-8f38-4592-870d-3ecf30d55d63")
 	)
 	(wire
 		(pts
@@ -3589,6 +3631,16 @@
 			(type default)
 		)
 		(uuid "43fc22ac-3202-4581-9642-de460bb7f8ce")
+	)
+	(wire
+		(pts
+			(xy 105.41 143.51) (xy 105.41 147.32)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "46c61681-e7db-4350-9507-fcd8c9d14ed0")
 	)
 	(wire
 		(pts
@@ -3719,16 +3771,6 @@
 			(type default)
 		)
 		(uuid "70c35d4c-6666-464a-94a2-6c1e4b21e5c4")
-	)
-	(wire
-		(pts
-			(xy 102.87 151.13) (xy 109.22 151.13)
-		)
-		(stroke
-			(width 0)
-			(type default)
-		)
-		(uuid "71b8abe0-0f38-43b8-99cd-1da7f4b7362b")
 	)
 	(wire
 		(pts
@@ -3912,7 +3954,7 @@
 	)
 	(wire
 		(pts
-			(xy 90.17 151.13) (xy 95.25 151.13)
+			(xy 90.17 151.13) (xy 100.33 151.13)
 		)
 		(stroke
 			(width 0)
@@ -5367,7 +5409,7 @@
 	)
 	(symbol
 		(lib_id "Device:R")
-		(at 99.06 151.13 90)
+		(at 100.33 147.32 180)
 		(unit 1)
 		(body_style 1)
 		(exclude_from_sim no)
@@ -5377,7 +5419,7 @@
 		(dnp no)
 		(uuid "3af703b3-a4dc-4f80-98a4-553e286e1838")
 		(property "Reference" "R1"
-			(at 99.06 148.844 90)
+			(at 98.044 147.32 90)
 			(show_name no)
 			(do_not_autoplace no)
 			(effects
@@ -5387,7 +5429,7 @@
 			)
 		)
 		(property "Value" "10K"
-			(at 99.06 153.67 90)
+			(at 102.87 147.32 90)
 			(show_name no)
 			(do_not_autoplace no)
 			(effects
@@ -5397,7 +5439,7 @@
 			)
 		)
 		(property "Footprint" "Resistor_THT:R_Axial_DIN0207_L6.3mm_D2.5mm_P10.16mm_Horizontal"
-			(at 99.06 152.908 90)
+			(at 102.108 147.32 90)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -5408,7 +5450,7 @@
 			)
 		)
 		(property "Datasheet" ""
-			(at 99.06 151.13 0)
+			(at 100.33 147.32 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -5419,7 +5461,7 @@
 			)
 		)
 		(property "Description" "Resistor"
-			(at 99.06 151.13 0)
+			(at 100.33 147.32 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)

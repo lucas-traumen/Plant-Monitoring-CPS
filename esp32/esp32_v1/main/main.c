@@ -1,13 +1,14 @@
 /**
  * @file main.c
- * @brief ESP32 Firmware v2.8.0 — Rau Cai Mam Brassica juncea Monitor (Raspberry Pi Hotspot + Topic v2)
+ * @brief ESP32 Firmware v2.9.3 — Sensor Fusion + Planting Start NVS Sync
  *
  * @details
- * - Sensors: DHT11 (Moving Average 5), BH1750, ADS1115 (4ch single-ended), DS3231 RTC
- * - Actuator: Pump relay (active HIGH, GPIO 26), Light relay (GPIO 27)
+ * - Sensors: DHT11, BH1750, ADS1115 4-point soil array, DS3231 RTC
+ * - Actuator: Pump relay (active HIGH, GPIO 19), Light relay (GPIO 18)
  * - Protocol: MQTT → Raspberry Pi broker (topic: cps/greenhouse/brassica_01/telemetry/sensors)
  * - Network: Tự động chuyển đổi giữa nhiều điểm truy cập WiFi (Multi-SSID) nếu rớt mạng.
- * - Resilience: Ring buffer 64 packets để lưu offline và tự động drain khi WiFi phục hồi.
+ * - Filtering: median samples -> EMA -> stuck/outlier check -> Schmid-Schossmaier FTI fusion.
+ * - Planting sync: ESP32 NVS is local cache; Gateway/DB is the source of truth.
  * - Phase owner: ESP32 đọc DS3231 RTC, tự tính Phase 1/2 theo planting_start_time,
  *   tự điều khiển đèn theo phase và gửi phase lên Raspberry Pi Gateway.
  * - Time sync: WiFi có mạng -> NTP -> cập nhật DS3231 nếu lệch > 5 giây.
@@ -83,7 +84,7 @@ static const wifi_cred_t WIFI_NETWORKS[] = {
 
 #define NODE_ID              "BRASSICA_JUNCEA_01"
 #define PLANT_NAME           "Rau Cải Mầm (Brassica juncea)"
-#define FW_VERSION           "2.8.0-rpi-hotspot-topic-v2"
+#define FW_VERSION           "2.9.3-filter-fusion-planting-sync"
 
 /* MQTT */
 #define MQTT_BROKER_URI      "mqtt://192.168.4.1"   /* Raspberry Pi hotspot broker */
@@ -162,8 +163,8 @@ static const ads111x_mux_t SOIL_MUX[SOIL_CH_COUNT] = {
 #define LIGHT_PHASE2_IDEAL   220.0f  /* lux -- Đèn LED tối ưu */
 
 /* Timings */
-#define SENSOR_READ_MS       5000
-#define MQTT_PUBLISH_MS      5000
+#define SENSOR_READ_MS       1000
+#define MQTT_PUBLISH_MS      1000
 #define LIGHT_CTRL_MS        1000   /* Chu kỳ kiểm tra lịch đèn theo RTC */
 
 /* NTP -> DS3231 RTC sync
@@ -199,8 +200,9 @@ static const ads111x_mux_t SOIL_MUX[SOIL_CH_COUNT] = {
 /* Phase start policy
  * - Phase 0 ngâm hạt nằm ngoài firmware.
  * - planting_start_epoch = thời điểm đã gieo hạt vào đất.
- * - Lần đầu boot: sau khi kiểm tra RTC/NTP, nếu NVS chưa có mốc thì lưu RTC hiện tại vào NVS.
+ * - DB/Unity/Web Start là nguồn chuẩn; ESP32 NVS chỉ là cache local để chạy offline.
  * - Reset/mất điện/flash thường: NVS còn, không reset mốc.
+ * - Nếu NVS chưa có mốc: KHÔNG tự BOOT_INIT bằng RTC hiện tại; publish valid=false và chờ Gateway SET_EPOCH.
  * - Bắt đầu lứa mới: gửi MQTT TOPIC_CMD_PLANTING_START action=SET_NOW/SET_EPOCH/CLEAR.
  */
 #define DARK_PHASE_DAYS     2.0f
@@ -219,6 +221,39 @@ static const ads111x_mux_t SOIL_MUX[SOIL_CH_COUNT] = {
 /* ADS1115 Calibration */
 #define SOIL_V_DRY           3.0f
 #define SOIL_V_WET           1.1f
+
+
+/* Sensor filter + soil fusion v2.9.2
+ * Sampling target: 1 second.
+ * Pipeline: ADS raw -> median samples -> voltage->% -> EMA with recovery -> Schmid-Schossmaier interval fusion.
+ * v2.9.2 adds:
+ * - Large-change confirm so EMA does not get stuck when sensor is plugged/unplugged.
+ * - Soil presence state for OPEN_AIR_OR_DRY / ACTIVE / REMOVED_OR_EXTREME_DRY / SHORT_GND.
+ * - Auto pump ON guard when soil is not reliable for plant-control.
+ */
+#define FILTER_TEMP_ALPHA             0.08f
+#define FILTER_HUM_ALPHA              0.08f
+#define FILTER_LUX_ALPHA              0.25f
+#define FILTER_SOIL_ALPHA             0.10f
+
+#define TEMP_MAX_JUMP_C               3.0f
+#define HUM_MAX_JUMP_PERCENT          10.0f
+#define LUX_MAX_JUMP_PERCENT          80.0f
+#define SOIL_MAX_JUMP_PERCENT         25.0f
+#define SOIL_JUMP_CONFIRM_COUNT       3     /* 3 mẫu liên tiếp mới chấp nhận thay đổi lớn */
+#define SOIL_RECOVERY_ALPHA           0.40f /* alpha cao khi xác nhận cắm/tháo thật */
+
+#define SOIL_MEDIAN_SAMPLES           5
+#define SOIL_SAMPLE_DELAY_MS          12
+#define SOIL_FUSION_ERROR_PERCENT     5.0f
+#define SOIL_FUSION_FAULT_TOLERANCE   1
+#define SOIL_MIN_VALID_COUNT          3
+#define SOIL_ZERO_STUCK_LIMIT         30    /* 30s liên tục 0%: cảnh báo stuck/khô cực hạn */
+#define SOIL_VOLTAGE_MIN_VALID       -0.05f
+#define SOIL_VOLTAGE_MAX_VALID        4.10f
+#define SOIL_RAIL_HIGH_V               3.25f  /* Gần 3V3: đất rất khô / chưa cắm đất / open-air */
+#define SOIL_RAIL_LOW_V                0.05f  /* Gần 0V: có thể chập GND / lỗi dây */
+#define SOIL_REMOVED_CONFIRM_COUNT     5      /* 5s rail-high sau khi từng ACTIVE -> nghi tháo ra */
 
 /* ================================================================
    BIẾN TOÀN CỤC & TẠO CẤU TRÚC DỮ LIỆU
@@ -258,7 +293,24 @@ static char              s_last_planting_cmd_id[PLANTING_CMD_ID_MAX] = {0};
 typedef struct {
     float temperature;
     float air_humidity;
-    float soil_pct[SOIL_CH_COUNT];
+    float soil_pct[SOIL_CH_COUNT];          /* Soil sau median + EMA từng kênh */
+    float soil_voltage[SOIL_CH_COUNT];      /* Điện áp ADS1115 sau median, để debug calibration */
+    float soil_avg_raw;                     /* Trung bình cộng 4 điểm sau lọc */
+    float soil_min;
+    float soil_max;
+    float soil_fused;                       /* Giá trị đại diện bằng Schmid-Schossmaier FTI */
+    float soil_fusion_lo;
+    float soil_fusion_hi;
+    float soil_fusion_confidence;           /* 0.0 .. 1.0 */
+    uint8_t  soil_valid_count;
+    uint16_t soil_zero_streak;
+    bool  soil_reliable;
+    bool  soil_stuck_zero;
+    bool  soil_saturated_dry;    /* Vraw sát 3V3: đất rất khô/chưa cắm đất, không tự coi là lỗi */
+    bool  soil_sensor_fault;     /* Vraw bất thường hoặc stuck không phải rail-high */
+    bool  soil_control_reliable; /* TRUE khi dữ liệu soil đủ tin cậy để Gateway AI điều khiển bơm */
+    char  soil_presence_state[32]; /* ACTIVE / OPEN_AIR_OR_DRY / REMOVED_OR_EXTREME_DRY / SHORT_GND */
+    char  soil_fusion_method[48];
     float lux;
     bool  pump_state;
     bool  light_state;
@@ -285,7 +337,7 @@ static sensor_data_t g_sensor = {0};
    ================================================================ */
 
 #define RING_BUF_SIZE        64     /* Số packet tối đa lưu khi offline */
-#define JSON_MAX_LEN         1024
+#define JSON_MAX_LEN         1536
 
 typedef struct {
     char  json[JSON_MAX_LEN];
@@ -703,6 +755,354 @@ static float ads_voltage_to_pct(double v) {
     return (SOIL_V_DRY - (float)v) / (SOIL_V_DRY - SOIL_V_WET) * 100.0f;
 }
 
+
+/* ================================================================
+   SENSOR FILTER + SCHMID-SCHOSSMAIER SOIL FUSION v2.9.2
+   ================================================================ */
+
+typedef struct {
+    bool initialized;
+    float temperature;
+    float air_humidity;
+    float lux;
+    float soil_pct[SOIL_CH_COUNT];
+    float soil_voltage[SOIL_CH_COUNT];
+    uint8_t soil_jump_count[SOIL_CH_COUNT];
+    bool soil_seen_active[SOIL_CH_COUNT];
+    uint16_t soil_rail_high_streak[SOIL_CH_COUNT];
+    uint16_t soil_rail_low_streak[SOIL_CH_COUNT];
+    uint16_t soil_zero_streak;
+    char soil_presence_state[32];
+} sensor_filter_state_t;
+
+static sensor_filter_state_t s_filter = {0};
+
+static float clampf_local(float x, float lo, float hi) {
+    if (x < lo) return lo;
+    if (x > hi) return hi;
+    return x;
+}
+
+static float absf_local(float x) {
+    return (x < 0.0f) ? -x : x;
+}
+
+static float ema_update(float prev, float cur, float alpha) {
+    return alpha * cur + (1.0f - alpha) * prev;
+}
+
+static float soil_ema_update_with_recovery(int ch, float previous, float current) {
+    float diff = absf_local(current - previous);
+
+    if (diff <= SOIL_MAX_JUMP_PERCENT) {
+        s_filter.soil_jump_count[ch] = 0;
+        return ema_update(previous, current, FILTER_SOIL_ALPHA);
+    }
+
+    /* Nhảy lớn 1-2 mẫu có thể là nhiễu. Nếu kéo dài >= SOIL_JUMP_CONFIRM_COUNT
+     * thì xem là thay đổi thật, ví dụ cắm cảm biến vào đất hoặc tháo cảm biến ra.
+     */
+    if (s_filter.soil_jump_count[ch] < 255) {
+        s_filter.soil_jump_count[ch]++;
+    }
+
+    if (s_filter.soil_jump_count[ch] >= SOIL_JUMP_CONFIRM_COUNT) {
+        s_filter.soil_jump_count[ch] = 0;
+        return ema_update(previous, current, SOIL_RECOVERY_ALPHA);
+    }
+
+    return previous;
+}
+
+static void sort_float_array(float *a, int n) {
+    for (int i = 0; i < n - 1; i++) {
+        for (int j = i + 1; j < n; j++) {
+            if (a[j] < a[i]) {
+                float t = a[i];
+                a[i] = a[j];
+                a[j] = t;
+            }
+        }
+    }
+}
+
+static float median_float_array(float *a, int n) {
+    sort_float_array(a, n);
+    if (n <= 0) return 0.0f;
+    if ((n % 2) == 1) return a[n / 2];
+    return 0.5f * (a[n / 2 - 1] + a[n / 2]);
+}
+
+static float median4_float(float a, float b, float c, float d) {
+    float x[4] = {a, b, c, d};
+    return median_float_array(x, 4);
+}
+
+static bool soil_voltage_valid(float v) {
+    return (v >= SOIL_VOLTAGE_MIN_VALID && v <= SOIL_VOLTAGE_MAX_VALID);
+}
+
+typedef struct {
+    float value;
+    float lo;
+    float hi;
+    float width;
+    float confidence;
+    uint8_t valid_count;
+    bool reliable;
+} soil_fusion_result_t;
+
+static soil_fusion_result_t soil_fuse_schmid_schossmaier_f1(const float soil_pct[SOIL_CH_COUNT],
+                                                            const float soil_voltage[SOIL_CH_COUNT]) {
+    const int n = SOIL_CH_COUNT;
+    const int f = SOIL_FUSION_FAULT_TOLERANCE;
+    const float err = SOIL_FUSION_ERROR_PERCENT;
+
+    float lo[SOIL_CH_COUNT] = {0};
+    float hi[SOIL_CH_COUNT] = {0};
+    float s[SOIL_CH_COUNT] = {0};
+    uint8_t valid_count = 0;
+
+    for (int i = 0; i < n; i++) {
+        s[i] = clampf_local(soil_pct[i], 0.0f, 100.0f);
+        if (soil_voltage_valid(soil_voltage[i])) valid_count++;
+        lo[i] = clampf_local(s[i] - err, 0.0f, 100.0f);
+        hi[i] = clampf_local(s[i] + err, 0.0f, 100.0f);
+    }
+
+    sort_float_array(lo, n);
+    sort_float_array(hi, n);
+
+    soil_fusion_result_t out = {0};
+    out.valid_count = valid_count;
+
+    /* f+1-th largest lower bound and f+1-th smallest upper bound.
+     * Với n=4, f=1: lower_idx=2, upper_idx=1.
+     */
+    int lower_idx = n - f - 1;
+    int upper_idx = f;
+
+    out.lo = lo[lower_idx];
+    out.hi = hi[upper_idx];
+
+    if (out.lo <= out.hi) {
+        float med = median4_float(s[0], s[1], s[2], s[3]);
+        out.value = clampf_local(med, out.lo, out.hi);
+        out.width = out.hi - out.lo;
+        out.confidence = clampf_local(1.0f - (out.width / 100.0f), 0.0f, 1.0f);
+        out.reliable = (valid_count >= SOIL_MIN_VALID_COUNT);
+    } else {
+        /* Khoảng rỗng nghĩa là các cảm biến lệch nhau quá mạnh.
+         * Fallback median để không bị trung bình kéo sai, nhưng hạ confidence.
+         */
+        out.value = median4_float(s[0], s[1], s[2], s[3]);
+        out.lo = out.value;
+        out.hi = out.value;
+        out.width = 100.0f;
+        out.confidence = 0.0f;
+        out.reliable = false;
+    }
+
+    return out;
+}
+
+static void apply_sensor_filter_and_fusion(sensor_data_t *s) {
+    if (!s) return;
+
+    if (!s_filter.initialized) {
+        s_filter.temperature = s->temperature;
+        s_filter.air_humidity = s->air_humidity;
+        s_filter.lux = s->lux;
+        for (int i = 0; i < SOIL_CH_COUNT; i++) {
+            s_filter.soil_pct[i] = s->soil_pct[i];
+            s_filter.soil_voltage[i] = s->soil_voltage[i];
+            s_filter.soil_jump_count[i] = 0;
+            s_filter.soil_seen_active[i] = false;
+            s_filter.soil_rail_high_streak[i] = 0;
+            s_filter.soil_rail_low_streak[i] = 0;
+        }
+        strlcpy(s_filter.soil_presence_state, "UNKNOWN", sizeof(s_filter.soil_presence_state));
+        s_filter.initialized = true;
+    }
+
+    if (s->dht11_ok) {
+        if (absf_local(s->temperature - s_filter.temperature) <= TEMP_MAX_JUMP_C) {
+            s_filter.temperature = ema_update(s_filter.temperature, s->temperature, FILTER_TEMP_ALPHA);
+        }
+        if (absf_local(s->air_humidity - s_filter.air_humidity) <= HUM_MAX_JUMP_PERCENT) {
+            s_filter.air_humidity = ema_update(s_filter.air_humidity, s->air_humidity, FILTER_HUM_ALPHA);
+        }
+    }
+
+    if (s->bh1750_ok) {
+        s_filter.lux = ema_update(s_filter.lux, s->lux, FILTER_LUX_ALPHA);
+    }
+
+    uint8_t voltage_valid_count = 0;
+    uint8_t active_now_count = 0;
+    uint8_t rail_high_count = 0;
+    uint8_t rail_low_count = 0;
+    uint8_t removed_like_count = 0;
+    uint8_t seen_active_count = 0;
+
+    bool all_zero = true;
+    float sum = 0.0f;
+    float min_v = 100.0f;
+    float max_v = 0.0f;
+
+    for (int i = 0; i < SOIL_CH_COUNT; i++) {
+        float vraw = s->soil_voltage[i];
+        bool v_valid = soil_voltage_valid(vraw);
+        bool rail_high = (vraw >= SOIL_RAIL_HIGH_V);
+        bool rail_low = (vraw <= SOIL_RAIL_LOW_V);
+        bool active_now = v_valid && !rail_high && !rail_low;
+
+        if (v_valid) voltage_valid_count++;
+        if (rail_high) rail_high_count++;
+        if (rail_low) rail_low_count++;
+        if (active_now) active_now_count++;
+
+        if (active_now) {
+            s_filter.soil_seen_active[i] = true;
+            s_filter.soil_rail_high_streak[i] = 0;
+            s_filter.soil_rail_low_streak[i] = 0;
+        } else if (rail_high) {
+            if (s_filter.soil_rail_high_streak[i] < 60000) s_filter.soil_rail_high_streak[i]++;
+            s_filter.soil_rail_low_streak[i] = 0;
+        } else if (rail_low) {
+            if (s_filter.soil_rail_low_streak[i] < 60000) s_filter.soil_rail_low_streak[i]++;
+            s_filter.soil_rail_high_streak[i] = 0;
+        }
+
+        if (s_filter.soil_seen_active[i]) seen_active_count++;
+        if (s_filter.soil_seen_active[i] &&
+            s_filter.soil_rail_high_streak[i] >= SOIL_REMOVED_CONFIRM_COUNT) {
+            removed_like_count++;
+        }
+
+        /* EMA soil có recovery:
+         * - Nhảy nhỏ: EMA bình thường alpha=0.10.
+         * - Nhảy lớn 1-2 mẫu: giữ giá trị cũ để chống spike.
+         * - Nhảy lớn >=3 mẫu: cập nhật nhanh alpha=0.40 để không kẹt khi cắm/tháo.
+         */
+        s_filter.soil_pct[i] = soil_ema_update_with_recovery(i,
+                                                              s_filter.soil_pct[i],
+                                                              s->soil_pct[i]);
+        s_filter.soil_voltage[i] = vraw;
+
+        if (s_filter.soil_pct[i] > 0.01f) all_zero = false;
+        sum += s_filter.soil_pct[i];
+        if (s_filter.soil_pct[i] < min_v) min_v = s_filter.soil_pct[i];
+        if (s_filter.soil_pct[i] > max_v) max_v = s_filter.soil_pct[i];
+    }
+
+    if (all_zero) {
+        if (s_filter.soil_zero_streak < 60000) {
+            s_filter.soil_zero_streak++;
+        }
+    } else {
+        s_filter.soil_zero_streak = 0;
+    }
+
+    bool all_rail_high = (rail_high_count == SOIL_CH_COUNT);
+    bool all_rail_low = (rail_low_count == SOIL_CH_COUNT);
+    bool stuck_zero = (s_filter.soil_zero_streak >= SOIL_ZERO_STUCK_LIMIT);
+    bool saturated_dry = all_zero && all_rail_high;
+
+    char presence[32] = "UNKNOWN";
+    bool sensor_fault = false;
+
+    if (voltage_valid_count < SOIL_MIN_VALID_COUNT) {
+        strlcpy(presence, "VOLTAGE_INVALID", sizeof(presence));
+        sensor_fault = true;
+    } else if (all_rail_low) {
+        strlcpy(presence, "SHORT_GND", sizeof(presence));
+        sensor_fault = true;
+    } else if (active_now_count >= SOIL_MIN_VALID_COUNT) {
+        strlcpy(presence, "ACTIVE", sizeof(presence));
+    } else if (all_rail_high && seen_active_count >= SOIL_MIN_VALID_COUNT &&
+               removed_like_count >= SOIL_MIN_VALID_COUNT) {
+        strlcpy(presence, "REMOVED_OR_EXTREME_DRY", sizeof(presence));
+    } else if (all_rail_high) {
+        strlcpy(presence, "OPEN_AIR_OR_DRY", sizeof(presence));
+    } else if (active_now_count > 0) {
+        strlcpy(presence, "PARTIAL_ACTIVE", sizeof(presence));
+    } else {
+        strlcpy(presence, "UNSTABLE", sizeof(presence));
+    }
+
+    if (stuck_zero && !saturated_dry) {
+        sensor_fault = true;
+    }
+
+    soil_fusion_result_t fusion = soil_fuse_schmid_schossmaier_f1(s_filter.soil_pct,
+                                                                  s_filter.soil_voltage);
+
+    bool control_reliable = fusion.reliable && !sensor_fault;
+    /* Dữ liệu soil chỉ nên dùng cho AI bơm khi ít nhất 3/4 kênh đang ở vùng hoạt động.
+     * OPEN_AIR_OR_DRY/REMOVED_OR_EXTREME_DRY không phải lúc nào là lỗi sensor,
+     * nhưng không đủ chắc để tự động bật bơm trong lúc test tháo/cắm cảm biến.
+     */
+    if (strcmp(presence, "ACTIVE") != 0) {
+        control_reliable = false;
+    }
+
+    s->temperature = clampf_local(s_filter.temperature, 0.0f, 60.0f);
+    s->air_humidity = clampf_local(s_filter.air_humidity, 0.0f, 100.0f);
+    s->lux = clampf_local(s_filter.lux, 0.0f, 120000.0f);
+
+    for (int i = 0; i < SOIL_CH_COUNT; i++) {
+        s->soil_pct[i] = clampf_local(s_filter.soil_pct[i], 0.0f, 100.0f);
+        s->soil_voltage[i] = s_filter.soil_voltage[i];
+    }
+
+    s->soil_avg_raw = sum / SOIL_CH_COUNT;
+    s->soil_min = min_v;
+    s->soil_max = max_v;
+    s->soil_fused = clampf_local(fusion.value, 0.0f, 100.0f);
+    s->soil_fusion_lo = fusion.lo;
+    s->soil_fusion_hi = fusion.hi;
+    s->soil_fusion_confidence = fusion.confidence;
+    s->soil_valid_count = voltage_valid_count;
+    s->soil_zero_streak = s_filter.soil_zero_streak;
+    s->soil_stuck_zero = stuck_zero;
+    s->soil_saturated_dry = saturated_dry;
+    s->soil_sensor_fault = sensor_fault;
+    s->soil_control_reliable = control_reliable;
+    s->soil_reliable = control_reliable;
+    strlcpy(s->soil_presence_state, presence, sizeof(s->soil_presence_state));
+    strlcpy(s->soil_fusion_method, "schmid_schossmaier_f1_median_ema_recovery", sizeof(s->soil_fusion_method));
+}
+
+static bool ads_read_channel_median_voltage(ads111x_mux_t mux, float *voltage_out) {
+    if (!voltage_out) return false;
+
+    float samples[SOIL_MEDIAN_SAMPLES] = {0};
+    int count = 0;
+
+    for (int k = 0; k < SOIL_MEDIAN_SAMPLES; k++) {
+        if (ads111x_set_input_mux(&s_ads_dev, mux) != ESP_OK) return false;
+        if (ads111x_start_conversion(&s_ads_dev) != ESP_OK) return false;
+
+        vTaskDelay(pdMS_TO_TICKS(SOIL_SAMPLE_DELAY_MS));
+
+        bool busy = true;
+        for (int w = 0; w < 8 && busy; w++) {
+            ads111x_is_busy(&s_ads_dev, &busy);
+            if (busy) vTaskDelay(pdMS_TO_TICKS(2));
+        }
+
+        int16_t raw_v = 0;
+        if (ads111x_get_value(&s_ads_dev, &raw_v) == ESP_OK) {
+            samples[count++] = (float)((double)raw_v * 4.096 / 32767.0);
+        }
+    }
+
+    if (count <= 0) return false;
+    *voltage_out = median_float_array(samples, count);
+    return true;
+}
+
 static bool mqtt_topic_match(esp_mqtt_event_handle_t ev, const char *topic) {
     size_t topic_len = strlen(topic);
     return (ev->topic_len == topic_len) &&
@@ -766,8 +1166,6 @@ static bool light_should_be_on_by_schedule(int phase, int hour_utc7) {
 }
 
 static int build_json(char *buf, size_t buf_len, const sensor_data_t *s, int step) {
-    float soil_avg = (s->soil_pct[0] + s->soil_pct[1] +
-                      s->soil_pct[2] + s->soil_pct[3]) / 4.0f;
     return snprintf(buf, buf_len,
         "{"
         "\"node_id\":\"%s\","
@@ -785,8 +1183,29 @@ static int build_json(char *buf, size_t buf_len, const sensor_data_t *s, int ste
             "\"air_humidity\":%.1f,"
             "\"lux\":%.2f,"
             "\"soil_moisture_avg\":%.1f,"
+            "\"soil_moisture_mean\":%.1f,"
+            "\"soil_moisture_fused\":%.1f,"
+            "\"soil_moisture_min\":%.1f,"
+            "\"soil_moisture_max\":%.1f,"
             "\"soil_moisture_raw\":{"
                 "\"s1\":%.1f,\"s2\":%.1f,\"s3\":%.1f,\"s4\":%.1f"
+            "},"
+            "\"soil_voltage_raw\":{"
+                "\"v1\":%.3f,\"v2\":%.3f,\"v3\":%.3f,\"v4\":%.3f"
+            "},"
+            "\"soil_fusion\":{"
+                "\"method\":\"%s\","
+                "\"lo\":%.1f,"
+                "\"hi\":%.1f,"
+                "\"confidence\":%.2f,"
+                "\"valid_count\":%u,"
+                "\"presence_state\":\"%s\","
+                "\"control_reliable\":%s,"
+                "\"reliable\":%s,"
+                "\"stuck_zero\":%s,"
+                "\"saturated_dry\":%s,"
+                "\"sensor_fault\":%s,"
+                "\"zero_streak\":%u"
             "}"
         "},"
         "\"status\":{"
@@ -809,8 +1228,20 @@ static int build_json(char *buf, size_t buf_len, const sensor_data_t *s, int ste
         s->days_after_planting,
         (long long)s_planting_start_epoch,
         s_planting_start_valid ? "true" : "false",
-        s->temperature, s->air_humidity, s->lux, soil_avg,
+        s->temperature, s->air_humidity, s->lux,
+        s->soil_fused, s->soil_avg_raw, s->soil_fused, s->soil_min, s->soil_max,
         s->soil_pct[0], s->soil_pct[1], s->soil_pct[2], s->soil_pct[3],
+        s->soil_voltage[0], s->soil_voltage[1], s->soil_voltage[2], s->soil_voltage[3],
+        s->soil_fusion_method[0] ? s->soil_fusion_method : "none",
+        s->soil_fusion_lo, s->soil_fusion_hi, s->soil_fusion_confidence,
+        (unsigned)s->soil_valid_count,
+        s->soil_presence_state[0] ? s->soil_presence_state : "UNKNOWN",
+        s->soil_control_reliable ? "true" : "false",
+        s->soil_reliable ? "true" : "false",
+        s->soil_stuck_zero ? "true" : "false",
+        s->soil_saturated_dry ? "true" : "false",
+        s->soil_sensor_fault ? "true" : "false",
+        (unsigned)s->soil_zero_streak,
         s->wifi_rssi,
         s->dht11_ok   ? "true" : "false",
         s->bh1750_ok  ? "true" : "false",
@@ -834,8 +1265,8 @@ static const char *phase_to_text(int phase) {
 }
 
 static float soil_avg_from_snapshot(const sensor_data_t *s) {
-    return (s->soil_pct[0] + s->soil_pct[1] +
-            s->soil_pct[2] + s->soil_pct[3]) / 4.0f;
+    if (!s) return 0.0f;
+    return s->soil_fused;
 }
 
 
@@ -976,17 +1407,43 @@ static void publish_planting_status(const char *event, const char *cmd_id, const
 }
 
 static bool planting_start_init_from_nvs_or_rtc(void) {
+    /* v2.9.3: NVS chỉ là cache local.
+     * Không tự tạo start_epoch=now khi NVS rỗng, vì làm che lỗi đồng bộ Unity/DB -> Gateway -> ESP32.
+     * Gateway sẽ reconcile DB desired_epoch với ESP32 actual_epoch và gửi SET_EPOCH khi cần.
+     */
     if (planting_start_load_from_nvs()) return true;
 
-    time_t now_epoch = 0;
-    if (!rtc_get_epoch_from_ds3231(&now_epoch)) {
-        ESP_LOGE(TAG, "PLANTING: NVS chưa có mốc và RTC chưa hợp lệ -> giữ BOOT_DEFAULT");
+    s_planting_start_epoch = 0;
+    s_planting_start_valid = false;
+    s_last_planting_cmd_id[0] = '\0';
+    ESP_LOGW(TAG, "PLANTING: NVS chưa có start_epoch -> valid=false, chờ Gateway/Unity SET_EPOCH");
+    return false;
+}
+
+static bool planting_start_save_verified(time_t epoch, const char *cmd_id) {
+    if (epoch <= 0) return false;
+
+    if (!planting_start_save_to_nvs(epoch, cmd_id)) {
         return false;
     }
 
-    bool ok = planting_start_save_to_nvs(now_epoch, "BOOT_INIT");
-    if (ok) ESP_LOGW(TAG, "PLANTING: NVS chưa có mốc, lấy RTC hiện tại làm mốc gieo ban đầu");
-    return ok;
+    /* Đọc lại NVS để xác nhận đã commit đúng epoch. */
+    s_planting_start_epoch = 0;
+    s_planting_start_valid = false;
+    s_last_planting_cmd_id[0] = '\0';
+
+    if (!planting_start_load_from_nvs()) {
+        ESP_LOGE(TAG, "PLANTING: verify failed, không đọc lại được NVS sau khi save");
+        return false;
+    }
+
+    if (!s_planting_start_valid || s_planting_start_epoch != epoch) {
+        ESP_LOGE(TAG, "PLANTING: verify mismatch, expected=%lld actual=%lld",
+                 (long long)epoch, (long long)s_planting_start_epoch);
+        return false;
+    }
+
+    return true;
 }
 
 static void handle_planting_start_command(esp_mqtt_event_handle_t ev) {
@@ -1016,10 +1473,10 @@ static void handle_planting_start_command(esp_mqtt_event_handle_t ev) {
             publish_planting_status("planting_start_error", cmd_id, "ERROR", "rtc_invalid");
             return;
         }
-        if (planting_start_save_to_nvs(now_epoch, cmd_id)) {
+        if (planting_start_save_verified(now_epoch, cmd_id)) {
             publish_planting_status("planting_start_updated", cmd_id, "DONE", reason[0] ? reason : "SET_NOW");
         } else {
-            publish_planting_status("planting_start_error", cmd_id, "ERROR", "nvs_save_failed");
+            publish_planting_status("planting_start_error", cmd_id, "ERROR", "nvs_save_verify_failed");
         }
     } else if (strcasecmp(action, "SET_EPOCH") == 0) {
         int64_t epoch = json_get_int64_value(payload, "planting_start_epoch", 0);
@@ -1028,15 +1485,17 @@ static void handle_planting_start_command(esp_mqtt_event_handle_t ev) {
             publish_planting_status("planting_start_error", cmd_id, "ERROR", "missing_epoch");
             return;
         }
-        if (planting_start_save_to_nvs((time_t)epoch, cmd_id)) {
+        if (planting_start_save_verified((time_t)epoch, cmd_id)) {
             publish_planting_status("planting_start_updated", cmd_id, "DONE", reason[0] ? reason : "SET_EPOCH");
         } else {
-            publish_planting_status("planting_start_error", cmd_id, "ERROR", "nvs_save_failed");
+            publish_planting_status("planting_start_error", cmd_id, "ERROR", "nvs_save_verify_failed");
         }
     } else if (strcasecmp(action, "CLEAR") == 0) {
-        planting_start_clear_nvs();
-        planting_start_init_from_nvs_or_rtc();
-        publish_planting_status("planting_start_cleared_recreated", cmd_id, "DONE", reason[0] ? reason : "CLEAR");
+        if (planting_start_clear_nvs()) {
+            publish_planting_status("planting_start_cleared", cmd_id, "DONE", reason[0] ? reason : "CLEAR");
+        } else {
+            publish_planting_status("planting_start_error", cmd_id, "ERROR", "nvs_clear_failed");
+        }
     } else if (strcasecmp(action, "GET") == 0) {
         publish_planting_status("planting_start_current", cmd_id, "DONE", reason[0] ? reason : "GET");
     } else {
@@ -1111,6 +1570,27 @@ static void handle_auto_pump_command(esp_mqtt_event_handle_t ev) {
     }
 
     bool on = parse_on_off_command(payload, false);
+
+    if (on) {
+        bool soil_ok_for_control = true;
+        char presence[32] = "UNKNOWN";
+        if (xSemaphoreTake(s_sensor_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            soil_ok_for_control = g_sensor.soil_control_reliable;
+            strlcpy(presence,
+                    g_sensor.soil_presence_state[0] ? g_sensor.soil_presence_state : "UNKNOWN",
+                    sizeof(presence));
+            xSemaphoreGive(s_sensor_mutex);
+        }
+
+        if (!soil_ok_for_control) {
+            set_pump_state(false, "AI_AUTO", "SOIL_UNRELIABLE_BLOCK_ON");
+            ESP_LOGW(TAG, "Block Gateway AUTO Pump ON: soil not reliable for control, presence=%s payload=%s",
+                     presence, payload);
+            publish_actuator_state("GATEWAY_CMD_PUMP_BLOCKED");
+            return;
+        }
+    }
+
     set_pump_state(on, "AI_AUTO", "GATEWAY_AI_AUTO");
     ESP_LOGI(TAG, "Gateway AUTO command: Pump -> %s", on ? "ON" : "OFF");
     publish_actuator_state("GATEWAY_CMD_PUMP");
@@ -1166,15 +1646,27 @@ static void handle_dt_light_command(esp_mqtt_event_handle_t ev, const char *mode
 static void log_sensor_snapshot(const sensor_data_t *s, int step, int ring_used) {
     ESP_LOGI(TAG,
              "SENSOR step=%d phase=%d(%s) source=%s days=%.2f rtc=%s time=%s | "
-             "T=%.1fC RH=%.1f%% Lux=%.2f Soil=%.1f%% "
-             "[%.1f %.1f %.1f %.1f] | Pump=%s Light=%s/%s reason=%s | "
-             "RSSI=%d MQTT=%s Buffer=%d/%d",
+             "T=%.1fC RH=%.1f%% Lux=%.2f SoilFused=%.1f%% Avg=%.1f%% Min=%.1f%% Max=%.1f%% "
+             "S[%.1f %.1f %.1f %.1f] V[%.3f %.3f %.3f %.3f] "
+             "fusion=[%.1f..%.1f] conf=%.2f presence=%s reliable=%s control=%s valid=%u stuck0=%s/%u dry=%s fault=%s | "
+             "Pump=%s Light=%s/%s reason=%s | RSSI=%d MQTT=%s Buffer=%d/%d",
              step, s->phase, phase_to_text(s->phase),
              s->phase_source[0] ? s->phase_source : "UNKNOWN",
              s->days_after_planting,
              s->rtc_ok ? "OK" : "ERR", s->iso_time,
-             s->temperature, s->air_humidity, s->lux, soil_avg_from_snapshot(s),
+             s->temperature, s->air_humidity, s->lux,
+             s->soil_fused, s->soil_avg_raw, s->soil_min, s->soil_max,
              s->soil_pct[0], s->soil_pct[1], s->soil_pct[2], s->soil_pct[3],
+             s->soil_voltage[0], s->soil_voltage[1], s->soil_voltage[2], s->soil_voltage[3],
+             s->soil_fusion_lo, s->soil_fusion_hi, s->soil_fusion_confidence,
+             s->soil_presence_state[0] ? s->soil_presence_state : "UNKNOWN",
+             s->soil_reliable ? "YES" : "NO",
+             s->soil_control_reliable ? "YES" : "NO",
+             (unsigned)s->soil_valid_count,
+             s->soil_stuck_zero ? "YES" : "NO",
+             (unsigned)s->soil_zero_streak,
+             s->soil_saturated_dry ? "YES" : "NO",
+             s->soil_sensor_fault ? "YES" : "NO",
              s->pump_state ? "ON" : "OFF",
              s->light_state ? "ON" : "OFF",
              s->light_mode[0] ? s->light_mode : "AUTO_RTC",
@@ -1474,6 +1966,7 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
                      "MQTT connected %s:%d — sub: auto/pump, direct/pump, direct/light, config/planting_start | buffer=%d/%d",
                      MQTT_BROKER_URI, MQTT_PORT, ring_count(), RING_BUF_SIZE);
             publish_actuator_state("MQTT_CONNECTED");
+            publish_planting_status("planting_start_current", "", "DONE", "MQTT_CONNECTED");
             break;
         case MQTT_EVENT_DISCONNECTED:
             s_mqtt_connected = false;
@@ -1582,7 +2075,7 @@ static void sensor_task(void *pv) {
     if (i2c_take(1500)) {
         if (ads111x_init_desc(&s_ads_dev, ADS1115_I2C_ADDR, I2C_MASTER_PORT, I2C_MASTER_SDA, I2C_MASTER_SCL) == ESP_OK
             && ads111x_set_mode(&s_ads_dev, ADS111X_MODE_SINGLE_SHOT) == ESP_OK
-            && ads111x_set_data_rate(&s_ads_dev, ADS111X_DATA_RATE_8) == ESP_OK
+            && ads111x_set_data_rate(&s_ads_dev, ADS111X_DATA_RATE_128) == ESP_OK
             && ads111x_set_gain(&s_ads_dev, ADS111X_GAIN_4V096) == ESP_OK) {
             ads_ready = true;
         } else {
@@ -1627,20 +2120,13 @@ static void sensor_task(void *pv) {
             bool all_ok = true;
             if (i2c_take(3000)) {
                 for (int i = 0; i < SOIL_CH_COUNT; i++) {
-                    if (ads111x_set_input_mux(&s_ads_dev, SOIL_MUX[i]) != ESP_OK) { all_ok = false; continue; }
-                    if (ads111x_start_conversion(&s_ads_dev) != ESP_OK) { all_ok = false; continue; }
-                    vTaskDelay(pdMS_TO_TICKS(150));
-
-                    bool busy = true;
-                    for (int w = 0; w < 8 && busy; w++) {
-                        ads111x_is_busy(&s_ads_dev, &busy);
-                        if (busy) vTaskDelay(pdMS_TO_TICKS(25));
-                    }
-                    int16_t raw_v = 0;
-                    if (ads111x_get_value(&s_ads_dev, &raw_v) == ESP_OK) {
-                        double voltage = (double)raw_v * 4.096 / 32767.0;
+                    float voltage = 0.0f;
+                    if (ads_read_channel_median_voltage(SOIL_MUX[i], &voltage)) {
+                        snap.soil_voltage[i] = voltage;
                         snap.soil_pct[i] = ads_voltage_to_pct(voltage);
-                    } else { all_ok = false; }
+                    } else {
+                        all_ok = false;
+                    }
                 }
                 i2c_give();
             } else {
@@ -1649,6 +2135,8 @@ static void sensor_task(void *pv) {
             }
             snap.ads1115_ok = all_ok;
         }
+
+        apply_sensor_filter_and_fusion(&snap);
 
         wifi_ap_record_t ap;
         if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) snap.wifi_rssi = ap.rssi;
@@ -1910,10 +2398,11 @@ void app_main(void) {
     hw_init();
     wifi_init();
 
-    /* BOOT FLOW chuẩn:
+    /* BOOT FLOW chuẩn v2.9.3:
      * 1) Nếu WiFi có IP thì check NTP và cập nhật DS3231 nếu lệch.
-     * 2) Sau khi RTC đã được kiểm tra, load/create planting_start_epoch trong NVS.
-     * 3) Task NTP sau đó chỉ sync DS3231 định kỳ, KHÔNG ghi lại mốc gieo.
+     * 2) Load planting_start_epoch từ NVS nếu có.
+     * 3) Nếu NVS rỗng: valid=false, KHÔNG tự tạo mốc mới. Gateway sẽ sync từ DB/Unity.
+     * 4) Task NTP sau đó chỉ sync DS3231 định kỳ, KHÔNG ghi lại mốc gieo.
      */
     EventBits_t boot_wifi_bits = xEventGroupGetBits(s_wifi_eg);
     if (boot_wifi_bits & WIFI_CONNECTED_BIT) {

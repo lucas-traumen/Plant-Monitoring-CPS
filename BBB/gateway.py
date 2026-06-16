@@ -65,7 +65,7 @@ BASE_DIR = Path(__file__).resolve().parent
 
 NODE_ID = "BRASSICA_JUNCEA_01"
 PLANT_NAME = "Rau Cải Mầm (Brassica juncea)"
-GW_VERSION = "3.5-rpi-hotspot-topic-v2"
+GW_VERSION = "3.6-filter-fusion-planting-sync"
 
 MODEL_PATH = BASE_DIR / "watering_random_forest_model.pkl"
 FEATURES_PATH = BASE_DIR / "model_features.json"
@@ -102,7 +102,7 @@ TOPIC_CMD_PLANTING_START = f"{TOPIC_ROOT}/{NODE_TOPIC_ID}/cmd/config/planting_st
 # ── InfluxDB Cloud ───────────────────────────────────────────────────────────
 ## Không hard-code token trong source code. Export biến môi trường trước khi chạy.
 INFLUX_URL_DEFAULT = "https://us-east-1-1.aws.cloud2.influxdata.com"
-INFLUX_TOKEN_DEFAULT = "6pSuWQaFLlWq6iRVfaRYEMwIO1DDEChBsG42HdDx5En6fuqpUx95j3xswbVNrcWxRrs_sizN6XXESjzNqcHzJA=="
+INFLUX_TOKEN_DEFAULT = ""
 INFLUX_ORG_DEFAULT = "DEV_TEAM"
 INFLUX_BUCKET_DEFAULT = "digital_twin_data"
 
@@ -158,6 +158,19 @@ def normalize_state(value: Any) -> str:
     if state in ("0", "FALSE", "OFF", "PUMP_OFF", "LIGHT_OFF"):
         return "OFF"
     return state or "UNKNOWN"
+
+
+def safe_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "y", "on"):
+        return True
+    if text in ("0", "false", "no", "n", "off"):
+        return False
+    return default
 
 
 def clamp_duration(value: Any, default_s: int, max_s: int) -> int:
@@ -320,6 +333,26 @@ class InfluxManager:
             .field("soil_s2", float(s.get("soil_s2", 0)))
             .field("soil_s3", float(s.get("soil_s3", 0)))
             .field("soil_s4", float(s.get("soil_s4", 0)))
+            .field("soil_moisture_fused", float(s.get("soil_moisture_fused", s.get("soil_moisture", 0))))
+            .field("soil_moisture_mean", float(s.get("soil_moisture_mean", s.get("soil_moisture", 0))))
+            .field("soil_moisture_min", float(s.get("soil_moisture_min", s.get("soil_moisture", 0))))
+            .field("soil_moisture_max", float(s.get("soil_moisture_max", s.get("soil_moisture", 0))))
+            .field("soil_voltage_v1", float(s.get("soil_voltage_v1", 0)))
+            .field("soil_voltage_v2", float(s.get("soil_voltage_v2", 0)))
+            .field("soil_voltage_v3", float(s.get("soil_voltage_v3", 0)))
+            .field("soil_voltage_v4", float(s.get("soil_voltage_v4", 0)))
+            .field("soil_fusion_lo", float(s.get("soil_fusion_lo", 0)))
+            .field("soil_fusion_hi", float(s.get("soil_fusion_hi", 0)))
+            .field("soil_fusion_confidence", float(s.get("soil_fusion_confidence", 0)))
+            .field("soil_fusion_valid_count", int(s.get("soil_fusion_valid_count", 0)))
+            .field("soil_presence_state", str(s.get("soil_presence_state", "UNKNOWN")))
+            .field("soil_fusion_method", str(s.get("soil_fusion_method", "")))
+            .field("soil_control_reliable", 1 if s.get("soil_control_reliable") else 0)
+            .field("soil_reliable", 1 if s.get("soil_reliable") else 0)
+            .field("soil_sensor_fault", 1 if s.get("soil_sensor_fault") else 0)
+            .field("soil_saturated_dry", 1 if s.get("soil_saturated_dry") else 0)
+            .field("soil_stuck_zero", 1 if s.get("soil_stuck_zero") else 0)
+            .field("soil_zero_streak", int(s.get("soil_zero_streak", 0)))
             .field("need_watering", int(ai.get("need_watering") or 0))
             .field("ai_confidence", float(ai.get("confidence", 0)))
             .field("prob_need_watering", float(ai.get("prob_need_watering", 0)))
@@ -330,6 +363,8 @@ class InfluxManager:
             .field("uptime_s", int(payload.get("uptime_s") or 0))
             .field("wifi_rssi", int(payload.get("wifi_rssi") or 0))
             .field("days_after_planting", float(payload.get("days_after_planting", -1.0)))
+            .field("planting_start_epoch", int(payload.get("planting_start_epoch") or 0))
+            .field("planting_start_valid", 1 if payload.get("planting_start_valid") else 0)
             .field("alert", str(payload.get("alert") or ""))
             .time(datetime.now(timezone.utc), WRITE_PRECISION_SECONDS)
         )
@@ -487,6 +522,7 @@ class InfluxManager:
 from(bucket: "{self.bucket}")
   |> range(start: -{lookback})
   |> filter(fn: (r) => r._measurement == "{MEAS_CMD}")
+  |> filter(fn: (r) => r.status == "DONE" or r.status == "ERROR")
   |> keep(columns: ["command_id"])
   |> group()
   |> distinct(column: "command_id")
@@ -534,6 +570,48 @@ from(bucket: "{self.bucket}")
                 })
 
         return commands
+
+
+    def query_latest_desired_planting_start(self, lookback: str = "30d") -> Optional[dict]:
+        """
+        Return newest DB/Unity desired planting_start epoch from measurement dt.
+        DB/Unity/Web is the source of truth; ESP32 NVS is only a local cache.
+        """
+        flux = f"""
+from(bucket: "{self.bucket}")
+  |> range(start: -{lookback})
+  |> filter(fn: (r) => r._measurement == "{MEAS_DT}")
+  |> filter(fn: (r) => r.target == "planting_start")
+  |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
+  |> sort(columns: ["_time"], desc: true)
+  |> limit(n: 50)
+"""
+        tables = self.query_api.query(flux, org=self.org)
+        for table in tables:
+            for rec in table.records:
+                v = rec.values
+                epoch = safe_int(v.get("planting_start_epoch"), 0)
+                action = str(v.get("action") or "").upper()
+                if action == "CLEAR":
+                    # A CLEAR command means no active desired start from DB.
+                    return {
+                        "time": v.get("_time"),
+                        "command_id": str(v.get("command_id") or ""),
+                        "action": "CLEAR",
+                        "planting_start_epoch": 0,
+                        "reason": str(v.get("reason") or "clear_start"),
+                        "source": str(v.get("source") or "digital_twin"),
+                    }
+                if epoch > 0:
+                    return {
+                        "time": v.get("_time"),
+                        "command_id": str(v.get("command_id") or ""),
+                        "action": action or "SET_EPOCH",
+                        "planting_start_epoch": epoch,
+                        "reason": str(v.get("reason") or "latest_db_start"),
+                        "source": str(v.get("source") or "digital_twin"),
+                    }
+        return None
 
 
 # =============================================================================
@@ -731,6 +809,8 @@ class EdgeAIWateringController:
             "phase": phase,
             "phase_source": sensor.get("phase_source", "MISSING"),
             "days_after_planting": sensor.get("days_after_planting", -1.0),
+            "planting_start_epoch": int(sensor.get("planting_start_epoch", 0)),
+            "planting_start_valid": bool(sensor.get("planting_start_valid", False)),
             "uptime_s": sensor.get("uptime_s", 0),
             "wifi_rssi": sensor.get("wifi_rssi", 0),
             "sensor": {
@@ -738,10 +818,30 @@ class EdgeAIWateringController:
                 "air_humidity": float(sensor["air_humidity"]),
                 "lux": float(sensor["lux"]),
                 "soil_moisture": float(sensor["soil_avg"]),
+                "soil_moisture_fused": float(sensor.get("soil_fused", sensor["soil_avg"])),
+                "soil_moisture_mean": float(sensor.get("soil_mean", sensor["soil_avg"])),
+                "soil_moisture_min": float(sensor.get("soil_min", sensor["soil_avg"])),
+                "soil_moisture_max": float(sensor.get("soil_max", sensor["soil_avg"])),
                 "soil_s1": float(sensor["soil_s1"]),
                 "soil_s2": float(sensor["soil_s2"]),
                 "soil_s3": float(sensor["soil_s3"]),
                 "soil_s4": float(sensor["soil_s4"]),
+                "soil_voltage_v1": float(sensor.get("soil_voltage_v1", 0.0)),
+                "soil_voltage_v2": float(sensor.get("soil_voltage_v2", 0.0)),
+                "soil_voltage_v3": float(sensor.get("soil_voltage_v3", 0.0)),
+                "soil_voltage_v4": float(sensor.get("soil_voltage_v4", 0.0)),
+                "soil_fusion_method": str(sensor.get("soil_fusion_method", "")),
+                "soil_fusion_lo": float(sensor.get("soil_fusion_lo", 0.0)),
+                "soil_fusion_hi": float(sensor.get("soil_fusion_hi", 0.0)),
+                "soil_fusion_confidence": float(sensor.get("soil_fusion_confidence", 0.0)),
+                "soil_fusion_valid_count": int(sensor.get("soil_fusion_valid_count", 0)),
+                "soil_presence_state": str(sensor.get("soil_presence_state", "UNKNOWN")),
+                "soil_control_reliable": bool(sensor.get("soil_control_reliable", False)),
+                "soil_reliable": bool(sensor.get("soil_reliable", False)),
+                "soil_stuck_zero": bool(sensor.get("soil_stuck_zero", False)),
+                "soil_saturated_dry": bool(sensor.get("soil_saturated_dry", False)),
+                "soil_sensor_fault": bool(sensor.get("soil_sensor_fault", False)),
+                "soil_zero_streak": int(sensor.get("soil_zero_streak", 0)),
             },
             "ai": {
                 "status": decision["status"],
@@ -797,19 +897,19 @@ def parse_sensor(raw: dict) -> dict:
     air_humidity = safe_float(s.get("air_humidity", s.get("hum", 0)))
     lux = safe_float(s.get("lux", 0))
 
-    if "soil_moisture_avg" in s:
-        soil_avg = safe_float(s["soil_moisture_avg"])
-    elif "soil_moisture" in s:
-        soil_avg = safe_float(s["soil_moisture"])
-    else:
-        vals = [safe_float(s.get(k), None) for k in ("s1", "s2", "s3", "s4") if s.get(k) is not None]
-        vals = [v for v in vals if v is not None]
-        soil_avg = sum(vals) / len(vals) if vals else 0.0
+    # Firmware v2.9.x keeps soil_moisture_avg as backward-compatible fused value.
+    soil_fused = safe_float(s.get("soil_moisture_fused", s.get("soil_moisture_avg", s.get("soil_moisture", 0))))
+    soil_avg = safe_float(s.get("soil_moisture_avg", soil_fused))
+    soil_mean = safe_float(s.get("soil_moisture_mean", soil_avg))
+    soil_min = safe_float(s.get("soil_moisture_min", soil_avg))
+    soil_max = safe_float(s.get("soil_moisture_max", soil_avg))
 
     raw_soil = s.get("soil_moisture_raw", {}) if isinstance(s.get("soil_moisture_raw", {}), dict) else {}
+    raw_voltage = s.get("soil_voltage_raw", {}) if isinstance(s.get("soil_voltage_raw", {}), dict) else {}
+    fusion = s.get("soil_fusion", {}) if isinstance(s.get("soil_fusion", {}), dict) else {}
 
     status = raw.get("status", {}) if isinstance(raw.get("status", {}), dict) else {}
-    light_state = "ON" if bool(status.get("light_on", False)) else "OFF"
+    light_state = "ON" if safe_bool(status.get("light_on", False)) else "OFF"
 
     phase_raw = raw.get("phase", None)
     phase = safe_int(phase_raw, 0)
@@ -821,14 +921,36 @@ def parse_sensor(raw: dict) -> dict:
         "air_humidity": air_humidity,
         "lux": lux,
         "soil_avg": soil_avg,
+        "soil_mean": soil_mean,
+        "soil_fused": soil_fused,
+        "soil_min": soil_min,
+        "soil_max": soil_max,
         "soil_s1": safe_float(raw_soil.get("s1", s.get("s1", soil_avg))),
         "soil_s2": safe_float(raw_soil.get("s2", s.get("s2", soil_avg))),
         "soil_s3": safe_float(raw_soil.get("s3", s.get("s3", soil_avg))),
         "soil_s4": safe_float(raw_soil.get("s4", s.get("s4", soil_avg))),
+        "soil_voltage_v1": safe_float(raw_voltage.get("v1", 0.0)),
+        "soil_voltage_v2": safe_float(raw_voltage.get("v2", 0.0)),
+        "soil_voltage_v3": safe_float(raw_voltage.get("v3", 0.0)),
+        "soil_voltage_v4": safe_float(raw_voltage.get("v4", 0.0)),
+        "soil_fusion_method": str(fusion.get("method") or ""),
+        "soil_fusion_lo": safe_float(fusion.get("lo", 0.0)),
+        "soil_fusion_hi": safe_float(fusion.get("hi", 0.0)),
+        "soil_fusion_confidence": safe_float(fusion.get("confidence", 0.0)),
+        "soil_fusion_valid_count": safe_int(fusion.get("valid_count", 0)),
+        "soil_presence_state": str(fusion.get("presence_state") or "UNKNOWN"),
+        "soil_control_reliable": safe_bool(fusion.get("control_reliable", False)),
+        "soil_reliable": safe_bool(fusion.get("reliable", False)),
+        "soil_stuck_zero": safe_bool(fusion.get("stuck_zero", False)),
+        "soil_saturated_dry": safe_bool(fusion.get("saturated_dry", False)),
+        "soil_sensor_fault": safe_bool(fusion.get("sensor_fault", False)),
+        "soil_zero_streak": safe_int(fusion.get("zero_streak", 0)),
         "phase": phase,
         "phase_source": raw.get("phase_source", "MISSING"),
         "esp_step": safe_int(raw.get("step", 0)),
         "days_after_planting": safe_float(raw.get("days_after_planting", -1.0), -1.0),
+        "planting_start_epoch": safe_int(raw.get("planting_start_epoch", 0)),
+        "planting_start_valid": safe_bool(raw.get("planting_start_valid", False)),
         "light_state": light_state,
         "light_mode": status.get("light_mode", "AUTO_RTC"),
         "light_reason": status.get("light_reason"),
@@ -951,6 +1073,15 @@ class GatewayApp:
         self.processed_command_ids: set[str] = set()
         self.sent_commands: dict[str, dict] = {}
 
+        # Planting start sync: DB/Unity desired epoch vs ESP32 NVS actual epoch.
+        self.desired_planting_start_epoch: int = 0
+        self.desired_planting_start_command_id: str = ""
+        self.actual_planting_start_epoch: int = 0
+        self.actual_planting_start_valid: bool = False
+        self.last_planting_reconcile_at: float = 0.0
+        self.planting_reconcile_interval_s: float = 10.0
+        self.planting_ack_timeout_s: float = 8.0
+
         # Chống spam cmd/pump: chỉ publish khi trạng thái đổi,
         # hoặc sau một khoảng heartbeat để ESP32 nhận lại nếu vừa reconnect.
         self.last_pump_sent: Optional[str] = None
@@ -1069,6 +1200,8 @@ class GatewayApp:
 
     def _handle_sensor(self, raw: dict) -> None:
         sensor = parse_sensor(raw)
+        self._update_actual_planting_from_sensor(sensor)
+        self._reconcile_planting_start_if_needed("telemetry")
         gw_step = self._next_gw_step()
         step = sensor["esp_step"] if sensor["esp_step"] > 0 else gw_step
 
@@ -1186,6 +1319,11 @@ class GatewayApp:
         if not command_id or not is_planting_ack:
             return
 
+        ack_epoch = safe_int(raw.get("planting_start_epoch"), 0)
+        ack_valid = safe_bool(raw.get("planting_start_valid", False))
+        self.actual_planting_start_epoch = ack_epoch
+        self.actual_planting_start_valid = ack_valid
+
         try:
             self.influx.write_planting_start_state(raw)
             self.influx.write_latest_state("planting_start", raw)
@@ -1205,6 +1343,12 @@ class GatewayApp:
         else:
             event_status = "DONE"
 
+        expected_epoch = safe_int(self.sent_commands.get(command_id, {}).get("planting_start_epoch"), 0)
+        if event_status == "DONE" and expected_epoch > 0 and ack_epoch != expected_epoch:
+            event_status = "ERROR"
+            raw = dict(raw)
+            raw["gateway_error"] = f"epoch_mismatch expected={expected_epoch} actual={ack_epoch}"
+
         try:
             self.influx.write_command_event(
                 command_id,
@@ -1215,12 +1359,13 @@ class GatewayApp:
         except Exception as exc:
             self.log.error(f"[InfluxDB] planting_start ACK event write error: {exc}")
 
+        was_gateway_sent = command_id in self.sent_commands
         self.processed_command_ids.add(command_id)
         self.sent_commands.pop(command_id, None)
 
         # Planting_start command is published as retained config command.
-        # After ESP32 ACKs, clear retained payload so old config command won't replay forever.
-        if event_status == "DONE":
+        # After ESP32 ACKs for a command sent by this Gateway, clear retained payload so old config command won't replay forever.
+        if event_status == "DONE" and was_gateway_sent:
             clear_ret = self.client.publish(TOPIC_CMD_PLANTING_START, payload=None, qos=MQTT_QOS, retain=True)
             if clear_ret.rc == mqtt.MQTT_ERR_SUCCESS:
                 self.log.info(f"[PLANTING_ACK] cleared retained {TOPIC_CMD_PLANTING_START}")
@@ -1240,10 +1385,24 @@ class GatewayApp:
         self.log.info("InfluxDB command bridge started: polling measurement dt.")
         while not self.stop_event.is_set():
             try:
+                self._refresh_desired_planting_start()
+                self._retry_timed_out_planting_start_commands()
+
                 commands = self.influx.query_pending_commands(lookback="24h", limit=20)
+                now = time.time()
                 for cmd in commands:
-                    if cmd["command_id"] in self.processed_command_ids:
+                    command_id = cmd["command_id"]
+                    target = str(cmd.get("target") or "").lower()
+
+                    if command_id in self.processed_command_ids:
                         continue
+
+                    # Planting start must wait for ESP32 ACK. If already SENT, retry only after timeout.
+                    if target == "planting_start" and command_id in self.sent_commands:
+                        sent_at = float(self.sent_commands[command_id].get("sent_at", 0.0))
+                        if (now - sent_at) < self.planting_ack_timeout_s:
+                            continue
+
                     self._send_influx_command(cmd)
             except Exception as exc:
                 self.log.error(f"[INFLUX_BRIDGE] query/send error: {exc}", exc_info=True)
@@ -1340,11 +1499,108 @@ class GatewayApp:
 
         if result.rc == mqtt.MQTT_ERR_SUCCESS:
             self.influx.write_command_event(command_id, "planting_start", "SENT", json.dumps(payload, ensure_ascii=False))
-            self.processed_command_ids.add(command_id)
-            self.sent_commands[command_id] = {"target": "planting_start", "action": action}
+            # Do NOT mark processed on SENT. Only ESP32 ACK DONE/ERROR closes this command.
+            self.sent_commands[command_id] = {
+                "target": "planting_start",
+                "action": action,
+                "planting_start_epoch": int(payload.get("planting_start_epoch") or 0),
+                "sent_at": time.time(),
+                "payload": payload,
+            }
+            if action == "SET_EPOCH" and int(payload.get("planting_start_epoch") or 0) > 0:
+                self.desired_planting_start_epoch = int(payload["planting_start_epoch"])
+                self.desired_planting_start_command_id = command_id
             self.log.warning(f"[INFLUX_BRIDGE] SENT id={command_id} -> {TOPIC_CMD_PLANTING_START}: {action}")
         else:
             self.influx.write_command_event(command_id, "planting_start", "ERROR", f"mqtt publish rc={result.rc}")
+            self.processed_command_ids.add(command_id)
+
+    def _update_actual_planting_from_sensor(self, sensor: dict) -> None:
+        epoch = safe_int(sensor.get("planting_start_epoch"), 0)
+        valid = safe_bool(sensor.get("planting_start_valid", False))
+        if epoch > 0 or valid != self.actual_planting_start_valid:
+            self.actual_planting_start_epoch = epoch
+            self.actual_planting_start_valid = valid
+
+    def _refresh_desired_planting_start(self) -> None:
+        desired = self.influx.query_latest_desired_planting_start(lookback="30d")
+        if not desired:
+            return
+
+        action = str(desired.get("action") or "").upper()
+        epoch = safe_int(desired.get("planting_start_epoch"), 0)
+        command_id = str(desired.get("command_id") or "")
+
+        if action == "CLEAR":
+            if self.desired_planting_start_epoch != 0:
+                self.log.warning("[PLANTING_SYNC] desired cleared by DB")
+            self.desired_planting_start_epoch = 0
+            self.desired_planting_start_command_id = command_id
+            return
+
+        if epoch <= 0:
+            return
+
+        if epoch != self.desired_planting_start_epoch:
+            self.log.warning(f"[PLANTING_SYNC] desired epoch from DB={epoch} command_id={command_id}")
+        self.desired_planting_start_epoch = epoch
+        self.desired_planting_start_command_id = command_id
+        self._reconcile_planting_start_if_needed("db_refresh")
+
+    def _reconcile_planting_start_if_needed(self, source: str) -> None:
+        desired = int(self.desired_planting_start_epoch or 0)
+        if desired <= 0:
+            return
+
+        actual = int(self.actual_planting_start_epoch or 0)
+        valid = bool(self.actual_planting_start_valid)
+        if valid and actual == desired:
+            return
+
+        now = time.time()
+        if (now - self.last_planting_reconcile_at) < self.planting_reconcile_interval_s:
+            return
+
+        command_id = f"reconcile-{desired}"
+        cmd = {
+            "command_id": command_id,
+            "target": "planting_start",
+            "action": "SET_EPOCH",
+            "planting_start_epoch": desired,
+            "reason": f"reconcile_db_vs_esp32_{source}",
+            "source": "gateway_reconcile",
+        }
+        self.log.warning(
+            f"[PLANTING_SYNC] mismatch desired={desired} actual={actual} valid={valid}; resend SET_EPOCH"
+        )
+        self._send_planting_start_command(cmd)
+        self.last_planting_reconcile_at = now
+
+    def _retry_timed_out_planting_start_commands(self) -> None:
+        now = time.time()
+        for command_id, cmd in list(self.sent_commands.items()):
+            if cmd.get("target") != "planting_start":
+                continue
+            sent_at = float(cmd.get("sent_at", 0.0))
+            if (now - sent_at) < self.planting_ack_timeout_s:
+                continue
+            payload = cmd.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            result = self.client.publish(
+                TOPIC_CMD_PLANTING_START,
+                json.dumps(payload, ensure_ascii=False),
+                qos=MQTT_QOS,
+                retain=True,
+            )
+            if result.rc == mqtt.MQTT_ERR_SUCCESS:
+                cmd["sent_at"] = now
+                self.influx.write_command_event(command_id, "planting_start", "SENT", json.dumps(payload, ensure_ascii=False))
+                self.log.warning(f"[PLANTING_SYNC] retry SET_EPOCH command_id={command_id}")
+            else:
+                self.influx.write_command_event(command_id, "planting_start", "ERROR", f"retry mqtt publish rc={result.rc}")
+                self.processed_command_ids.add(command_id)
+                self.sent_commands.pop(command_id, None)
 
     def _set_direct_active(self, target: str, duration_s: int) -> None:
         with self.direct_lock:

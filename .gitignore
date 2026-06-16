@@ -19,3 +19,6 @@ dist/
 # Runtime data
 *.csv
 *.log
+# KiCad temporary lock files
+*.lck
+~*.lck
