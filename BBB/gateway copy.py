@@ -67,7 +67,7 @@ BASE_DIR = Path(__file__).resolve().parent
 
 NODE_ID = "BRASSICA_JUNCEA_01"
 PLANT_NAME = "Rau Cải Mầm (Brassica juncea)"
-GW_VERSION = "3.8.2-direct-guard-stable-command"
+GW_VERSION = "3.8.1-direct-command-guard"
 
 MODEL_PATH = BASE_DIR / "watering_random_forest_model.pkl"
 FEATURES_PATH = BASE_DIR / "model_features.json"
@@ -104,7 +104,7 @@ TOPIC_CMD_PLANTING_START = f"{TOPIC_ROOT}/{NODE_TOPIC_ID}/cmd/config/planting_st
 # ── InfluxDB Cloud ───────────────────────────────────────────────────────────
 ## Không hard-code token trong source code. Export biến môi trường trước khi chạy.
 INFLUX_URL_DEFAULT = "https://us-east-1-1.aws.cloud2.influxdata.com"
-INFLUX_TOKEN_DEFAULT = ""
+INFLUX_TOKEN_DEFAULT = "6pSuWQaFLlWq6iRVfaRYEMwIO1DDEChBsG42HdDx5En6fuqpUx95j3xswbVNrcWxRrs_sizN6XXESjzNqcHzJA=="
 INFLUX_ORG_DEFAULT = "DEV_TEAM"
 INFLUX_BUCKET_DEFAULT = "digital_twin_data"
 
@@ -1238,7 +1238,7 @@ class GatewayApp:
             client.subscribe(TOPIC_SENSOR, qos=MQTT_QOS)
             client.subscribe(TOPIC_STATUS_ESP32, qos=MQTT_QOS)
             client.subscribe(TOPIC_ACTUATOR_STATE, qos=MQTT_QOS)
-            # v3.8.2: Gateway cũng nghe lệnh DIRECT do Backend/Web publish.
+            # v3.8.1: Gateway cũng nghe lệnh DIRECT do Backend/Web publish.
             # Mục tiêu không phải để chuyển tiếp lệnh, mà để bật "direct guard"
             # tránh AI AUTO pump gửi OFF/ON đè lên lệnh tay trong lúc ESP32 đang thực thi.
             client.subscribe(TOPIC_CMD_PUMP_DIRECT, qos=MQTT_QOS)
@@ -1281,7 +1281,7 @@ class GatewayApp:
             elif msg.topic == TOPIC_ACTUATOR_STATE:
                 self._handle_actuator_state(raw)
             elif msg.topic in (TOPIC_CMD_PUMP_DIRECT, TOPIC_CMD_LIGHT_DIRECT):
-                # v3.8.2: Backend/Web đã publish trực tiếp xuống ESP32.
+                # v3.8.1: Backend/Web đã publish trực tiếp xuống ESP32.
                 # Gateway chỉ quan sát để tạm khóa AI AUTO tránh ghi đè lệnh tay.
                 self._handle_direct_command_guard(raw, msg.topic)
             else:
@@ -1310,7 +1310,7 @@ class GatewayApp:
         # ON: giữ guard theo duration để AI không gửi OFF đè.
         # OFF: guard ngắn để ESP32 xử lý xong rồi cho AI quay lại.
         if state == "ON":
-            guard_s = max(duration_s + 3, 8 if target == "pump" else 3)
+            guard_s = duration_s + 3
         elif state == "OFF":
             guard_s = 2
         else:

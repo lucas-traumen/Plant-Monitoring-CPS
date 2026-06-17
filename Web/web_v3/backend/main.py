@@ -1,6 +1,6 @@
 """
 Plant Monitoring CPS Backend
-Version: v1.3.0-web-first-command-controller
+Version: v1.3.3-low-latency-db-async
 
 Mục tiêu bản v1.3.0:
 - Web chạy trước, Unity dùng lại cùng API/WebSocket qua Tailscale.
@@ -45,7 +45,7 @@ from pydantic import BaseModel, Field
 
 load_dotenv()
 
-API_VERSION = "1.3.0-web-first-command-controller"
+API_VERSION = "1.3.3-low-latency-db-async"
 NODE_ID = os.getenv("NODE_ID", "BRASSICA_JUNCEA_01")
 NODE_TOPIC_ID = os.getenv("NODE_TOPIC_ID", "brassica_01")
 PLANT_NAME = os.getenv("PLANT_NAME", "Rau Cải Mầm (Brassica juncea)")
@@ -65,7 +65,7 @@ TOPICS = {
 MQTT_BROKER = os.getenv("MQTT_BROKER", "127.0.0.1")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
 MQTT_QOS = int(os.getenv("MQTT_QOS", "1"))
-MQTT_CLIENT_ID = os.getenv("MQTT_CLIENT_ID", "plant_backend_v1_3_0")
+MQTT_CLIENT_ID = os.getenv("MQTT_CLIENT_ID", "plant_backend_v1_3_3")
 
 INFLUX_URL = os.getenv("INFLUX_URL") or os.getenv("INFLUXDB_URL") or "https://us-east-1-1.aws.cloud2.influxdata.com"
 INFLUX_TOKEN = os.getenv("INFLUX_TOKEN") or os.getenv("INFLUXDB_TOKEN") or ""
@@ -74,15 +74,16 @@ INFLUX_BUCKET = os.getenv("INFLUX_BUCKET") or os.getenv("INFLUXDB_BUCKET") or "d
 
 REALTIME_INGEST_TOKEN = os.getenv("REALTIME_INGEST_TOKEN", "")
 
-COMMAND_ACK_TIMEOUT_S = float(os.getenv("COMMAND_ACK_TIMEOUT_S", "3.0"))
+COMMAND_ACK_TIMEOUT_S = float(os.getenv("COMMAND_ACK_TIMEOUT_S", "1.8"))
 COMMAND_MAX_RETRIES = int(os.getenv("COMMAND_MAX_RETRIES", "3"))
-COMMAND_RETRY_SCAN_S = float(os.getenv("COMMAND_RETRY_SCAN_S", "0.25"))
-COMMAND_TTL_S = float(os.getenv("COMMAND_TTL_S", "15.0"))
+COMMAND_RETRY_SCAN_S = float(os.getenv("COMMAND_RETRY_SCAN_S", "0.20"))
+COMMAND_TTL_S = float(os.getenv("COMMAND_TTL_S", "7.0"))
+DIRECT_COMMAND_TTL_S = float(os.getenv("DIRECT_COMMAND_TTL_S", "8.0"))
 
-PUMP_DEBOUNCE_MS = int(os.getenv("PUMP_DEBOUNCE_MS", "500"))
-LIGHT_DEBOUNCE_MS = int(os.getenv("LIGHT_DEBOUNCE_MS", "250"))
-PUMP_MIN_INTERVAL_S = float(os.getenv("PUMP_MIN_INTERVAL_S", "1.0"))
-LIGHT_MIN_INTERVAL_S = float(os.getenv("LIGHT_MIN_INTERVAL_S", "0.5"))
+PUMP_DEBOUNCE_MS = int(os.getenv("PUMP_DEBOUNCE_MS", "150"))
+LIGHT_DEBOUNCE_MS = int(os.getenv("LIGHT_DEBOUNCE_MS", "100"))
+PUMP_MIN_INTERVAL_S = float(os.getenv("PUMP_MIN_INTERVAL_S", "0.7"))
+LIGHT_MIN_INTERVAL_S = float(os.getenv("LIGHT_MIN_INTERVAL_S", "0.25"))
 PUMP_MAX_DURATION_S = int(os.getenv("PUMP_MAX_DURATION_S", "15"))
 LIGHT_MAX_DURATION_S = int(os.getenv("LIGHT_MAX_DURATION_S", "1800"))
 
@@ -99,7 +100,7 @@ WRITE_PRECISION_SECONDS = getattr(WritePrecision, "S", None) or getattr(WritePre
 
 app = FastAPI(
     title="Plant Monitoring CPS Web API",
-    description="Web-first realtime MQTT/WebSocket backend with command controller.",
+    description="Web-first realtime MQTT/WebSocket backend with low-latency command controller.",
     version=API_VERSION,
 )
 
@@ -315,6 +316,41 @@ def write_dt_command_log(command: dict[str, Any], status: str, message: str = ""
             point = point.field("planting_start_epoch", int(command.get("planting_start_epoch") or 0))
     write_influx_point(point)
 
+
+
+def schedule_background_call(func, *args, **kwargs) -> None:
+    """Run slow side-effect work without blocking realtime MQTT command publish.
+
+    InfluxDB Cloud writes can take 1-2 seconds on this Pi/network. In older
+    versions, command endpoints wrote QUEUED/SENT to InfluxDB before the MQTT
+    packet reached Mosquitto, which made broker-side latency look like packet
+    loss. For realtime direct pump/light commands, MQTT publish is the first
+    priority; DB logging is best-effort background work.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(asyncio.to_thread(func, *args, **kwargs))
+    except RuntimeError:
+        try:
+            func(*args, **kwargs)
+        except Exception:
+            pass
+
+
+def log_cmd_event(cmd_id: str, target: str, status: str, message: str = "", seq: int = 0, background: bool = False) -> None:
+    if background:
+        schedule_background_call(write_cmd_event, cmd_id, target, status, message, seq)
+    else:
+        write_cmd_event(cmd_id, target, status, message, seq)
+
+
+def log_dt_command(command: dict[str, Any], status: str, message: str = "", background: bool = False) -> None:
+    if background:
+        schedule_background_call(write_dt_command_log, command, status, message)
+    else:
+        write_dt_command_log(command, status, message)
+
+
 # =============================================================================
 # WEBSOCKET + REALTIME CACHE
 # =============================================================================
@@ -481,7 +517,8 @@ def publish_mqtt(topic: str, payload: dict[str, Any], retain: bool = False) -> N
     if mqtt_client is None:
         raise HTTPException(status_code=503, detail="MQTT client is not initialized")
     info = mqtt_client.publish(topic, json.dumps(payload, ensure_ascii=False), qos=MQTT_QOS, retain=retain)
-    info.wait_for_publish(timeout=2.0)
+    # Do not block the HTTP command path waiting for broker PUBACK.
+    # Application-level ACK from ESP32/state is the real completion signal.
     if info.rc != mqtt.MQTT_ERR_SUCCESS:
         raise HTTPException(status_code=503, detail=f"MQTT publish failed rc={info.rc}")
 
@@ -545,6 +582,53 @@ def controller_config(target: str) -> tuple[float, float]:
     return 0.0, 0.0
 
 
+def is_direct_target(target: str) -> bool:
+    return target in ("pump", "light")
+
+
+def enrich_direct_payload(payload: dict[str, Any], target: str) -> dict[str, Any]:
+    """Add safety metadata for direct actuator commands.
+
+    ESP32 v2.9.4 accepts command_id/seq. TTL/expires_at_ms are harmless for old
+    firmware and useful for newer firmware to drop stale commands after reconnect.
+    """
+    if not is_direct_target(target):
+        return payload
+    now_ms = int(time.time() * 1000)
+    ttl_s = float(payload.get("ttl_s") or DIRECT_COMMAND_TTL_S)
+    expires_at_ms = now_ms + int(ttl_s * 1000)
+    action = safe_upper(payload.get("action") or payload.get("state"))
+    return {
+        **payload,
+        "action": action,
+        "ttl_s": ttl_s,
+        "created_at_ms": now_ms,
+        "expires_at_ms": expires_at_ms,
+    }
+
+
+def command_is_latest_for_target(cmd: PendingCommand) -> bool:
+    if not is_direct_target(cmd.target):
+        return True
+    return cmd.seq >= TARGET_SEQ.get(cmd.target, 0)
+
+
+async def supersede_pending_target(target: str, new_command_id: str) -> list[PendingCommand]:
+    """Remove older pending direct commands for the same actuator.
+
+    This prevents an old retry from being published after a newer user command,
+    which previously looked like packet loss or command ordering bugs.
+    """
+    superseded: list[PendingCommand] = []
+    if not is_direct_target(target):
+        return superseded
+    async with COMMAND_LOCK:
+        for cid, old in list(PENDING_COMMANDS.items()):
+            if old.target == target and old.command_id != new_command_id:
+                superseded.append(PENDING_COMMANDS.pop(cid))
+    return superseded
+
+
 async def broadcast_event(event: dict[str, Any]) -> None:
     EVENT_BUFFER.append(event)
     await manager.broadcast(event)
@@ -586,8 +670,9 @@ async def mark_command_done(cmd: PendingCommand, status: str = "DONE", message: 
         if existing is None:
             return
         cmd.status = status
-    write_cmd_event(cmd.command_id, cmd.target, status, message, seq=cmd.seq)
-    write_dt_command_log({**cmd.payload, "mqtt_topic": cmd.topic}, status, message)
+    bg_log = is_direct_target(cmd.target)
+    log_cmd_event(cmd.command_id, cmd.target, status, message, seq=cmd.seq, background=bg_log)
+    log_dt_command({**cmd.payload, "mqtt_topic": cmd.topic}, status, message, background=bg_log)
     await broadcast_command_status(cmd, status, message)
     if cmd.target == "planting_start" and cmd.retain and status in ("DONE", "DUPLICATE", "ERROR"):
         clear_retained(cmd.topic)
@@ -599,14 +684,16 @@ async def publish_pending_command(cmd: PendingCommand, first_send: bool = False)
         cmd.sent_monotonic = time.monotonic()
         cmd.next_deadline = cmd.sent_monotonic + COMMAND_ACK_TIMEOUT_S
         cmd.status = "SENT" if first_send else "RETRY"
-        write_cmd_event(cmd.command_id, cmd.target, cmd.status, json.dumps(cmd.payload, ensure_ascii=False), seq=cmd.seq)
-        write_dt_command_log({**cmd.payload, "mqtt_topic": cmd.topic}, cmd.status)
+        bg_log = is_direct_target(cmd.target)
+        log_cmd_event(cmd.command_id, cmd.target, cmd.status, json.dumps(cmd.payload, ensure_ascii=False), seq=cmd.seq, background=bg_log)
+        log_dt_command({**cmd.payload, "mqtt_topic": cmd.topic}, cmd.status, background=bg_log)
         await broadcast_command_status(cmd, cmd.status, "published to MQTT QoS1")
     except Exception as exc:
         cmd.status = "ERROR"
         cmd.last_error = str(exc)
-        write_cmd_event(cmd.command_id, cmd.target, "ERROR", str(exc), seq=cmd.seq)
-        write_dt_command_log({**cmd.payload, "mqtt_topic": cmd.topic}, "ERROR", str(exc))
+        bg_log = is_direct_target(cmd.target)
+        log_cmd_event(cmd.command_id, cmd.target, "ERROR", str(exc), seq=cmd.seq, background=bg_log)
+        log_dt_command({**cmd.payload, "mqtt_topic": cmd.topic}, "ERROR", str(exc), background=bg_log)
         await broadcast_command_status(cmd, "ERROR", str(exc))
         async with COMMAND_LOCK:
             PENDING_COMMANDS.pop(cmd.command_id, None)
@@ -622,7 +709,7 @@ async def delayed_send_for_target(target: str) -> None:
     if cmd is None:
         return
 
-    # Rate limit theo actuator để chống spam. Trong thời gian chờ, nếu có lệnh mới hơn thì ưu tiên lệnh mới.
+    # Rate-limit actuator commands, but always re-check latest after waiting.
     wait_s = max(0.0, min_interval_s - (time.monotonic() - TARGET_LAST_SENT_AT.get(target, 0.0)))
     if wait_s > 0:
         await asyncio.sleep(wait_s)
@@ -631,6 +718,14 @@ async def delayed_send_for_target(target: str) -> None:
         if newer is not None:
             await broadcast_command_status(cmd, "SUPERSEDED", f"replaced by newer {target} command before publish")
             cmd = newer
+
+    # Do not publish stale queued commands if another command arrived while waiting.
+    if not command_is_latest_for_target(cmd):
+        await broadcast_command_status(cmd, "SUPERSEDED", f"stale {target} command seq={cmd.seq}; latest={TARGET_SEQ.get(target, 0)}")
+        return
+
+    for old in await supersede_pending_target(target, cmd.command_id):
+        await broadcast_command_status(old, "SUPERSEDED", f"replaced by newer {target} command_id={cmd.command_id}")
 
     TARGET_LAST_SENT_AT[target] = time.monotonic()
     async with COMMAND_LOCK:
@@ -653,10 +748,11 @@ async def submit_coalesced_command(target: str, payload: dict[str, Any], source:
         "reason": reason,
         "sent_at": utc_now_iso(),
     }
+    payload = enrich_direct_payload(payload, target)
     cmd = PendingCommand(
         command_id=command_id,
         target=target,
-        desired_state=safe_upper(payload.get("state")),
+        desired_state=safe_upper(payload.get("state") or payload.get("action")),
         seq=seq,
         payload=payload,
         topic=topic,
@@ -666,22 +762,42 @@ async def submit_coalesced_command(target: str, payload: dict[str, Any], source:
         status="QUEUED",
     )
 
-    write_cmd_event(command_id, target, "QUEUED", json.dumps(payload, ensure_ascii=False), seq=seq)
-    write_dt_command_log({**payload, "mqtt_topic": topic}, "QUEUED")
+    bg_log = is_direct_target(target)
+    log_cmd_event(command_id, target, "QUEUED", json.dumps(payload, ensure_ascii=False), seq=seq, background=bg_log)
+    log_dt_command({**payload, "mqtt_topic": topic}, "QUEUED", background=bg_log)
+
+    # Supersede older already-sent direct commands so their retry cannot arrive late.
+    for old in await supersede_pending_target(target, command_id):
+        await broadcast_command_status(old, "SUPERSEDED", f"replaced by newer {target} command_id={command_id}")
+
+    debounce_s, min_interval_s = controller_config(target)
+    elapsed_s = time.monotonic() - TARGET_LAST_SENT_AT.get(target, 0.0)
+    can_fast_publish = is_direct_target(target) and elapsed_s >= min_interval_s
 
     async with COMMAND_LOCK:
         old = LATEST_DESIRED_BY_TARGET.get(target)
-        LATEST_DESIRED_BY_TARGET[target] = cmd
-        task = TARGET_TASKS.get(target)
-        if task is not None and not task.done():
-            # Task hiện tại sẽ tự lấy latest sau debounce; không tạo task mới.
-            pass
+        if can_fast_publish:
+            LATEST_DESIRED_BY_TARGET.pop(target, None)
+            TARGET_LAST_SENT_AT[target] = time.monotonic()
+            PENDING_COMMANDS[command_id] = cmd
         else:
-            TARGET_TASKS[target] = asyncio.create_task(delayed_send_for_target(target))
+            LATEST_DESIRED_BY_TARGET[target] = cmd
+            task = TARGET_TASKS.get(target)
+            if task is None or task.done():
+                TARGET_TASKS[target] = asyncio.create_task(delayed_send_for_target(target))
 
     if old is not None:
         await broadcast_command_status(old, "SUPERSEDED", f"replaced by newer {target} command")
-    await broadcast_command_status(cmd, "QUEUED", "queued by command controller")
+
+    if can_fast_publish:
+        await broadcast_command_status(cmd, "QUEUED", "fast-path direct command queued")
+        await publish_pending_command(cmd, first_send=True)
+        status_msg = cmd.status
+        message = "Fast path: published MQTT QoS1 immediately, waiting ESP32 ACK/state."
+    else:
+        await broadcast_command_status(cmd, "QUEUED", "queued by command controller")
+        status_msg = "QUEUED"
+        message = "Queued. Backend will debounce/rate-limit, publish MQTT QoS1, then wait ESP32 ACK/state."
 
     return {
         "ok": True,
@@ -689,11 +805,11 @@ async def submit_coalesced_command(target: str, payload: dict[str, Any], source:
         "command_id": command_id,
         "target": target,
         "seq": seq,
-        "status": "QUEUED",
+        "status": status_msg,
         "mqtt_topic": topic,
         "retain": retain,
         "payload": payload,
-        "message": "Queued. Backend will debounce/rate-limit, publish MQTT QoS1, then wait ESP32 ACK/state.",
+        "message": message,
     }
 
 
@@ -751,6 +867,9 @@ async def retry_worker() -> None:
                 if cmd.status not in ("SENT", "RETRY"):
                     continue
                 if now - cmd.created_monotonic > COMMAND_TTL_S:
+                    todo_timeout.append(cmd)
+                    continue
+                if not command_is_latest_for_target(cmd):
                     todo_timeout.append(cmd)
                     continue
                 if cmd.next_deadline and now >= cmd.next_deadline:
@@ -942,6 +1061,7 @@ def health() -> dict[str, Any]:
             "light_debounce_ms": LIGHT_DEBOUNCE_MS,
             "pump_min_interval_s": PUMP_MIN_INTERVAL_S,
             "light_min_interval_s": LIGHT_MIN_INTERVAL_S,
+            "direct_command_ttl_s": DIRECT_COMMAND_TTL_S,
         },
         "timestamp": utc_now_iso(),
     }
