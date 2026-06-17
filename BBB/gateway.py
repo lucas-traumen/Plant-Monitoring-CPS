@@ -104,7 +104,7 @@ TOPIC_CMD_PLANTING_START = f"{TOPIC_ROOT}/{NODE_TOPIC_ID}/cmd/config/planting_st
 # ── InfluxDB Cloud ───────────────────────────────────────────────────────────
 ## Không hard-code token trong source code. Export biến môi trường trước khi chạy.
 INFLUX_URL_DEFAULT = "https://us-east-1-1.aws.cloud2.influxdata.com"
-INFLUX_TOKEN_DEFAULT = ""
+INFLUX_TOKEN_DEFAULT = "6pSuWQaFLlWq6iRVfaRYEMwIO1DDEChBsG42HdDx5En6fuqpUx95j3xswbVNrcWxRrs_sizN6XXESjzNqcHzJA=="
 INFLUX_ORG_DEFAULT = "DEV_TEAM"
 INFLUX_BUCKET_DEFAULT = "digital_twin_data"
 

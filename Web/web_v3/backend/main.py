@@ -45,7 +45,7 @@ from pydantic import BaseModel, Field
 
 load_dotenv()
 
-API_VERSION = "1.3.3-low-latency-db-async"
+API_VERSION = "1.3.5-int32-safe-epoch-seq"
 NODE_ID = os.getenv("NODE_ID", "BRASSICA_JUNCEA_01")
 NODE_TOPIC_ID = os.getenv("NODE_TOPIC_ID", "brassica_01")
 PLANT_NAME = os.getenv("PLANT_NAME", "Rau Cải Mầm (Brassica juncea)")
@@ -78,7 +78,7 @@ COMMAND_ACK_TIMEOUT_S = float(os.getenv("COMMAND_ACK_TIMEOUT_S", "1.8"))
 COMMAND_MAX_RETRIES = int(os.getenv("COMMAND_MAX_RETRIES", "3"))
 COMMAND_RETRY_SCAN_S = float(os.getenv("COMMAND_RETRY_SCAN_S", "0.20"))
 COMMAND_TTL_S = float(os.getenv("COMMAND_TTL_S", "7.0"))
-DIRECT_COMMAND_TTL_S = float(os.getenv("DIRECT_COMMAND_TTL_S", "8.0"))
+DIRECT_COMMAND_TTL_S = float(os.getenv("DIRECT_COMMAND_TTL_S", "15.0"))
 
 PUMP_DEBOUNCE_MS = int(os.getenv("PUMP_DEBOUNCE_MS", "150"))
 LIGHT_DEBOUNCE_MS = int(os.getenv("LIGHT_DEBOUNCE_MS", "100"))
@@ -586,23 +586,41 @@ def is_direct_target(target: str) -> bool:
     return target in ("pump", "light")
 
 
+def next_seq_for_target(target: str) -> int:
+    """Return a monotonic command sequence for the target.
+
+    v1.3.5: direct actuator commands use an int32-safe epoch-seconds sequence
+    instead of epoch-ms. ESP32 cJSON valueint is int32; epoch-ms overflows to
+    2147483647, which can make later commands look stale. Epoch-seconds is
+    monotonic across Backend restarts and still fits signed int32 until 2038.
+    """
+    if is_direct_target(target):
+        now_seq = int(time.time())  # int32-safe epoch seconds
+        seq = max(now_seq, TARGET_SEQ.get(target, 0) + 1)
+    else:
+        seq = TARGET_SEQ.get(target, 0) + 1
+    TARGET_SEQ[target] = seq
+    return seq
+
+
 def enrich_direct_payload(payload: dict[str, Any], target: str) -> dict[str, Any]:
     """Add safety metadata for direct actuator commands.
 
-    ESP32 v2.9.4 accepts command_id/seq. TTL/expires_at_ms are harmless for old
-    firmware and useful for newer firmware to drop stale commands after reconnect.
+    ESP32 accepts command_id/seq and newer firmware uses ttl_s/expires_at_ms to
+    drop stale commands after reconnect. v1.3.5 keeps seq int32-safe while
+    created_at_ms/expires_at_ms remain epoch-ms for TTL checks.
     """
     if not is_direct_target(target):
         return payload
-    now_ms = int(time.time() * 1000)
+    created_at_ms = int(payload.get("created_at_ms") or int(time.time() * 1000))
     ttl_s = float(payload.get("ttl_s") or DIRECT_COMMAND_TTL_S)
-    expires_at_ms = now_ms + int(ttl_s * 1000)
+    expires_at_ms = int(payload.get("expires_at_ms") or (created_at_ms + int(ttl_s * 1000)))
     action = safe_upper(payload.get("action") or payload.get("state"))
     return {
         **payload,
         "action": action,
         "ttl_s": ttl_s,
-        "created_at_ms": now_ms,
+        "created_at_ms": created_at_ms,
         "expires_at_ms": expires_at_ms,
     }
 
@@ -735,8 +753,7 @@ async def delayed_send_for_target(target: str) -> None:
 
 async def submit_coalesced_command(target: str, payload: dict[str, Any], source: str, reason: str) -> dict[str, Any]:
     topic, retain = topic_for_target(target)
-    TARGET_SEQ[target] = TARGET_SEQ.get(target, 0) + 1
-    seq = TARGET_SEQ[target]
+    seq = next_seq_for_target(target)
     command_id = payload.get("command_id") or make_command_id(source, target)
     payload = {
         **payload,
@@ -748,6 +765,8 @@ async def submit_coalesced_command(target: str, payload: dict[str, Any], source:
         "reason": reason,
         "sent_at": utc_now_iso(),
     }
+    if is_direct_target(target):
+        payload["created_at_ms"] = int(time.time() * 1000)
     payload = enrich_direct_payload(payload, target)
     cmd = PendingCommand(
         command_id=command_id,
@@ -815,8 +834,7 @@ async def submit_coalesced_command(target: str, payload: dict[str, Any], source:
 
 async def submit_immediate_command(target: str, payload: dict[str, Any], source: str, reason: str) -> dict[str, Any]:
     topic, retain = topic_for_target(target)
-    TARGET_SEQ[target] = TARGET_SEQ.get(target, 0) + 1
-    seq = TARGET_SEQ[target]
+    seq = next_seq_for_target(target)
     command_id = payload.get("command_id") or make_command_id(source, target)
     payload = {
         **payload,
@@ -828,6 +846,8 @@ async def submit_immediate_command(target: str, payload: dict[str, Any], source:
         "reason": reason,
         "sent_at": utc_now_iso(),
     }
+    if is_direct_target(target):
+        payload["created_at_ms"] = int(time.time() * 1000)
     cmd = PendingCommand(
         command_id=command_id,
         target=target,

@@ -1,17 +1,19 @@
 /**
  * @file main.c
- * @brief ESP32 Firmware v2.9.3 — Sensor Fusion + Planting Start NVS Sync
+ * @brief ESP32 Firmware v2.9.6 — Realtime Command Priority + Sensor Cache
  *
  * @details
  * - Sensors: DHT11, BH1750, ADS1115 4-point soil array, DS3231 RTC
  * - Actuator: Pump relay (active HIGH, GPIO 19), Light relay (GPIO 18)
- * - Protocol: MQTT → Raspberry Pi broker (topic: cps/greenhouse/brassica_01/telemetry/sensors)
- * - Network: Tự động chuyển đổi giữa nhiều điểm truy cập WiFi (Multi-SSID) nếu rớt mạng.
+ * - Protocol: MQTT → Raspberry Pi broker qua router/LAN (topic: cps/greenhouse/brassica_01/telemetry/sensors)
+ * - Network: ESP32 kết nối WiFi router thường; Raspberry Pi dùng LAN IP 192.168.2.54 làm MQTT broker.
  * - Filtering: median samples -> EMA -> stuck/outlier check -> Schmid-Schossmaier FTI fusion.
  * - Planting sync: ESP32 NVS is local cache; Gateway/DB is the source of truth.
  * - Phase owner: ESP32 đọc DS3231 RTC, tự tính Phase 1/2 theo planting_start_time,
  *   tự điều khiển đèn theo phase và gửi phase lên Raspberry Pi Gateway.
  * - Time sync: WiFi có mạng -> NTP -> cập nhật DS3231 nếu lệch > 5 giây.
+ * - Realtime control: MQTT callback chỉ enqueue, actuator_cmd_task ưu tiên cao xử lý Pump/Light.
+ * - Sensor realtime mềm: publish 1s/gói; DHT11 đọc riêng 2s/lần và cache giá trị để tránh checksum block command.
  */
 
 #include <stdio.h>
@@ -52,7 +54,7 @@
 #endif
 
 /* ================================================================
-   CẤU HÌNH WIFI — ESP32 KẾT NỐI RASPBERRY PI HOTSPOT
+   CẤU HÌNH WIFI — ESP32 KẾT NỐI WIFI ROUTER THƯỜNG
    ================================================================ */
 
 /**
@@ -64,12 +66,23 @@ typedef struct {
 } wifi_cred_t;
 
 /**
- * @brief Danh sách các mạng WiFi dự phòng. 
- * ESP32 kết nối vào hotspot Plant-Gateway do Raspberry Pi phát.
+ * @brief Danh sách WiFi cho ESP32.
+ *
+ * Bản v2.9.8.3 chuyển khỏi Raspberry Pi hotspot, bỏ sensors/latest không dùng và trả DHT11 về GPIO4.
+ * ESP32 nên bắt WiFi router thường; Raspberry Pi cắm LAN vào router.
+ *
+ * QUAN TRỌNG: đổi ROUTER_WIFI_PASS thành mật khẩu WiFi thật trước khi flash.
  */
+#ifndef ROUTER_WIFI_SSID
+#define ROUTER_WIFI_SSID "Phòng toàn trai đẹp"
+#endif
+#ifndef ROUTER_WIFI_PASS
+#define ROUTER_WIFI_PASS "aicungdeptrai<3"
+#endif
+
 static const wifi_cred_t WIFI_NETWORKS[] = {
-    /* Raspberry Pi hotspot: wlan0=192.168.4.1, Mosquitto=192.168.4.1:1883 */
-    {"Plant-Gateway", "Plant123456"}
+    /* Router WiFi thường; Pi broker qua LAN: 192.168.2.54:1883 */
+    {ROUTER_WIFI_SSID, ROUTER_WIFI_PASS}
 };
 #define WIFI_NETWORK_COUNT (sizeof(WIFI_NETWORKS) / sizeof(wifi_cred_t))
 #define WIFI_MAX_RETRY       3      /**< Số lần thử tối đa cho mỗi mạng trước khi đổi mạng khác */
@@ -84,13 +97,20 @@ static const wifi_cred_t WIFI_NETWORKS[] = {
 
 #define NODE_ID              "BRASSICA_JUNCEA_01"
 #define PLANT_NAME           "Rau Cải Mầm (Brassica juncea)"
-#define FW_VERSION           "2.9.4-direct-command-ack"
+#define FW_VERSION           "2.9.8.3-router-lan-no-latest-dht-gpio4"
 
 /* MQTT */
-#define MQTT_BROKER_URI      "mqtt://192.168.4.1"   /* Raspberry Pi hotspot broker */
+#define MQTT_BROKER_URI      "mqtt://192.168.2.54"  /* Raspberry Pi eth0 LAN broker, MQTT_PORT=1883 */
 #define MQTT_PORT            1883
 #define MQTT_KEEPALIVE_S     60
-#define MQTT_QOS             1
+/* v2.9.7: tách QoS theo loại dữ liệu để tránh nghẽn socket MQTT.
+ * - Command/ACK/Status vẫn QoS1 cho chắc.
+ * - Telemetry realtime 1s dùng QoS0, không lưu offline/drain lại 64 gói cũ.
+ */
+#define MQTT_QOS             1   /* backward-compatible default */
+#define MQTT_QOS_COMMAND     1
+#define MQTT_QOS_STATUS      1
+#define MQTT_QOS_TELEMETRY   0
 #define MQTT_CLIENT_ID       "esp32_brassica_01"
 
 /* MQTT topic tree v2: cps/greenhouse/<node>/... */
@@ -100,6 +120,7 @@ static const wifi_cred_t WIFI_NETWORKS[] = {
 /* ESP32 -> Broker */
 #define TOPIC_SENSOR \
     TOPIC_ROOT "/" NODE_TOPIC_ID "/telemetry/sensors"
+
 
 #define TOPIC_STATUS_ESP32 \
     TOPIC_ROOT "/" NODE_TOPIC_ID "/status/esp32"
@@ -163,7 +184,8 @@ static const ads111x_mux_t SOIL_MUX[SOIL_CH_COUNT] = {
 #define LIGHT_PHASE2_IDEAL   220.0f  /* lux -- Đèn LED tối ưu */
 
 /* Timings */
-#define SENSOR_READ_MS       1000
+#define SENSOR_READ_MS       1000    /* vòng sensor nhanh: soil/lux cập nhật ~1s */
+#define DHT11_READ_MS        2000    /* DHT11 không nên đọc quá nhanh; cache vẫn publish mỗi 1s */
 #define MQTT_PUBLISH_MS      1000
 #define LIGHT_CTRL_MS        1000   /* Chu kỳ kiểm tra lịch đèn theo RTC */
 
@@ -180,10 +202,12 @@ static const ads111x_mux_t SOIL_MUX[SOIL_CH_COUNT] = {
 #define RTC_NTP_SYNC_PERIOD_MS    (24 * 60 * 60 * 1000)
 
 /* Local debug logs: hữu ích khi Raspberry Pi Gateway/MQTT chưa bật */
-#define SENSOR_LOG_EVERY_N        1    /* 1 = log mỗi gói sensor, tương ứng ~5s */
+#define SENSOR_LOG_EVERY_N        5    /* log sensor mỗi ~5s; tránh ESP_LOGI dài làm nhiễu latency */
 #define LIGHT_LOG_HEARTBEAT_S     30   /* log trạng thái đèn mỗi 30s nếu không đổi */
-#define OFFLINE_LOG_EVERY_N       5    /* khi MQTT mất, log buffer mỗi 5 packet */
-#define DRAIN_MAX_PER_CYCLE       5    /* số packet offline đẩy lại mỗi chu kỳ publish */
+#define OFFLINE_LOG_EVERY_N       10   /* khi MQTT mất, log drop telemetry mỗi 10 gói */
+#define DRAIN_MAX_PER_CYCLE       0    /* v2.9.7: không drain lại telemetry cũ để tránh nghẽn MQTT */
+#define SENSOR_LATEST_QOS1_MS     10000 /* snapshot latest QoS1 retain mỗi 10s */
+#define TELEMETRY_RING_ENABLE     0     /* realtime telemetry 1s không lưu offline */
 
 /* Digital Twin direct safety timeout */
 #define DT_PUMP_DEFAULT_DURATION_S   10
@@ -215,6 +239,14 @@ static const ads111x_mux_t SOIL_MUX[SOIL_CH_COUNT] = {
 /* Task core pinning */
 #define CORE_NET            0
 #define CORE_APP            1
+
+/* Task priorities: command phải cao hơn sensor/DHT để relay không bị chờ checksum/I2C. */
+#define PRIO_ACTUATOR_CMD    10
+#define PRIO_ACTUATOR_STATE  8
+#define PRIO_LIGHT_SCHEDULE  5
+#define PRIO_SENSOR          4
+#define PRIO_PUBLISH         3
+#define PRIO_NTP_RTC         2
 
 #define LIGHT_ON_HOUR_UTC7   8
 #define LIGHT_OFF_HOUR_UTC7  16
@@ -295,6 +327,33 @@ static char              s_last_pump_cmd_id[DIRECT_CMD_ID_MAX] = {0};
 static int               s_last_pump_cmd_seq = 0;
 static char              s_last_light_cmd_id[DIRECT_CMD_ID_MAX] = {0};
 static int               s_last_light_cmd_seq = 0;
+
+/* v2.9.8: bảo vệ lỗi cũ khi Backend từng gửi seq=epoch_ms làm cJSON/valueint bão hòa int32.
+ * Giá trị 2147483647 là dấu hiệu seq lỗi, phải bỏ qua/reset để lệnh mới epoch_seconds chạy được.
+ */
+#define CMD_SEQ_INT32_SATURATION_GUARD 2147483600
+
+/* v2.9.6: MQTT callback chỉ copy command vào queue rồi return ngay.
+ * actuator_cmd_task (Core 1, priority cao) xử lý relay + ACK tức thì,
+ * tránh DHT11 checksum/I2C/sensor fusion làm trễ command.
+ */
+#define CMD_QUEUE_LEN        12
+#define CMD_PAYLOAD_MAX      384
+
+typedef enum {
+    CMD_KIND_AUTO_PUMP = 1,
+    CMD_KIND_DIRECT_PUMP,
+    CMD_KIND_DIRECT_LIGHT,
+    CMD_KIND_PLANTING_START
+} cmd_kind_t;
+
+typedef struct {
+    cmd_kind_t kind;
+    char payload[CMD_PAYLOAD_MAX];
+    int64_t rx_us;
+} cmd_msg_t;
+
+static QueueHandle_t s_cmd_queue = NULL;
 
 /**
  * @brief Cấu trúc bản ghi chứa toàn bộ dữ liệu Snapshot từ cảm biến
@@ -773,6 +832,7 @@ typedef struct {
     bool initialized;
     float temperature;
     float air_humidity;
+    bool dht_initialized;
     float lux;
     float soil_pct[SOIL_CH_COUNT];
     float soil_voltage[SOIL_CH_COUNT];
@@ -919,8 +979,19 @@ static void apply_sensor_filter_and_fusion(sensor_data_t *s) {
     if (!s) return;
 
     if (!s_filter.initialized) {
-        s_filter.temperature = s->temperature;
-        s_filter.air_humidity = s->air_humidity;
+        /* v2.9.8.3: không khởi tạo filter DHT bằng 0 khi DHT chưa đọc OK.
+         * Nếu DHT lỗi lúc boot, giữ dht_initialized=false để JSON báo -1 và dht11_ok=false,
+         * tránh Web/Gateway hiểu nhầm 0.0°C/0.0% là dữ liệu thật.
+         */
+        if (s->dht11_ok) {
+            s_filter.temperature = s->temperature;
+            s_filter.air_humidity = s->air_humidity;
+            s_filter.dht_initialized = true;
+        } else {
+            s_filter.temperature = -1.0f;
+            s_filter.air_humidity = -1.0f;
+            s_filter.dht_initialized = false;
+        }
         s_filter.lux = s->lux;
         for (int i = 0; i < SOIL_CH_COUNT; i++) {
             s_filter.soil_pct[i] = s->soil_pct[i];
@@ -935,11 +1006,17 @@ static void apply_sensor_filter_and_fusion(sensor_data_t *s) {
     }
 
     if (s->dht11_ok) {
-        if (absf_local(s->temperature - s_filter.temperature) <= TEMP_MAX_JUMP_C) {
-            s_filter.temperature = ema_update(s_filter.temperature, s->temperature, FILTER_TEMP_ALPHA);
-        }
-        if (absf_local(s->air_humidity - s_filter.air_humidity) <= HUM_MAX_JUMP_PERCENT) {
-            s_filter.air_humidity = ema_update(s_filter.air_humidity, s->air_humidity, FILTER_HUM_ALPHA);
+        if (!s_filter.dht_initialized) {
+            s_filter.temperature = s->temperature;
+            s_filter.air_humidity = s->air_humidity;
+            s_filter.dht_initialized = true;
+        } else {
+            if (absf_local(s->temperature - s_filter.temperature) <= TEMP_MAX_JUMP_C) {
+                s_filter.temperature = ema_update(s_filter.temperature, s->temperature, FILTER_TEMP_ALPHA);
+            }
+            if (absf_local(s->air_humidity - s_filter.air_humidity) <= HUM_MAX_JUMP_PERCENT) {
+                s_filter.air_humidity = ema_update(s_filter.air_humidity, s->air_humidity, FILTER_HUM_ALPHA);
+            }
         }
     }
 
@@ -1056,8 +1133,14 @@ static void apply_sensor_filter_and_fusion(sensor_data_t *s) {
         control_reliable = false;
     }
 
-    s->temperature = clampf_local(s_filter.temperature, 0.0f, 60.0f);
-    s->air_humidity = clampf_local(s_filter.air_humidity, 0.0f, 100.0f);
+    if (s_filter.dht_initialized) {
+        s->temperature = clampf_local(s_filter.temperature, 0.0f, 60.0f);
+        s->air_humidity = clampf_local(s_filter.air_humidity, 0.0f, 100.0f);
+    } else {
+        s->temperature = -1.0f;
+        s->air_humidity = -1.0f;
+        s->dht11_ok = false;
+    }
     s->lux = clampf_local(s_filter.lux, 0.0f, 120000.0f);
 
     for (int i = 0; i < SOIL_CH_COUNT; i++) {
@@ -1374,6 +1457,66 @@ static int64_t json_get_int64_value(const char *json, const char *key, int64_t d
     return strtoll(p, NULL, 10);
 }
 
+static int64_t current_unix_ms_if_valid(void) {
+    time_t now_s = time(NULL);
+    /* > 2023-11: chỉ check TTL khi hệ thống/RTC đã có giờ hợp lệ. */
+    if (now_s < 1700000000) return 0;
+    return ((int64_t)now_s) * 1000LL;
+}
+
+static bool command_payload_expired(const char *payload, const char *cmd_id) {
+    int64_t now_ms = current_unix_ms_if_valid();
+    if (now_ms <= 0) return false;
+
+    int64_t expires_ms = json_get_int64_value(payload, "expires_at_ms", 0);
+    if (expires_ms > 0 && now_ms > expires_ms) {
+        ESP_LOGW(TAG, "Drop expired command cmd_id=%s now_ms=%lld expires_at_ms=%lld",
+                 cmd_id && cmd_id[0] ? cmd_id : "NONE",
+                 (long long)now_ms, (long long)expires_ms);
+        return true;
+    }
+
+    int64_t created_ms = json_get_int64_value(payload, "created_at_ms", 0);
+    int ttl_s = json_get_int_value(payload, "ttl_s", 0);
+    if (created_ms > 0 && ttl_s > 0 && now_ms > created_ms + ((int64_t)ttl_s * 1000LL)) {
+        ESP_LOGW(TAG, "Drop TTL command cmd_id=%s now_ms=%lld created_at_ms=%lld ttl_s=%d",
+                 cmd_id && cmd_id[0] ? cmd_id : "NONE",
+                 (long long)now_ms, (long long)created_ms, ttl_s);
+        return true;
+    }
+    return false;
+}
+
+static bool cmd_seq_is_saturated_int32(int seq) {
+    return seq >= CMD_SEQ_INT32_SATURATION_GUARD;
+}
+
+static void reset_saturated_last_seq_if_needed(const char *target) {
+    if (strcasecmp(target, "pump") == 0) {
+        if (cmd_seq_is_saturated_int32(s_last_pump_cmd_seq)) {
+            ESP_LOGW(TAG, "Reset saturated last_pump_seq=%d -> 0", s_last_pump_cmd_seq);
+            s_last_pump_cmd_seq = 0;
+            s_last_pump_cmd_id[0] = '\0';
+        }
+    } else if (strcasecmp(target, "light") == 0) {
+        if (cmd_seq_is_saturated_int32(s_last_light_cmd_seq)) {
+            ESP_LOGW(TAG, "Reset saturated last_light_seq=%d -> 0", s_last_light_cmd_seq);
+            s_last_light_cmd_seq = 0;
+            s_last_light_cmd_id[0] = '\0';
+        }
+    }
+}
+
+static bool incoming_seq_is_invalid_saturated(int seq, const char *cmd_id, const char *target) {
+    if (cmd_seq_is_saturated_int32(seq)) {
+        ESP_LOGW(TAG, "Drop saturated %s command seq=%d cmd_id=%s — backend cũ/retained cũ",
+                 target ? target : "UNKNOWN", seq,
+                 cmd_id && cmd_id[0] ? cmd_id : "NONE");
+        return true;
+    }
+    return false;
+}
+
 static bool planting_command_is_duplicate(const char *cmd_id) {
     return (cmd_id && cmd_id[0] && s_last_planting_cmd_id[0] &&
             strncmp(cmd_id, s_last_planting_cmd_id, sizeof(s_last_planting_cmd_id)) == 0);
@@ -1412,7 +1555,7 @@ static void publish_planting_status(const char *event, const char *cmd_id, const
         reason ? reason : "",
         now_iso);
 
-    if (len > 0) esp_mqtt_client_publish(s_mqtt, TOPIC_STATUS_ESP32, payload, len, MQTT_QOS, 0);
+    if (len > 0) esp_mqtt_client_publish(s_mqtt, TOPIC_STATUS_ESP32, payload, len, MQTT_QOS_STATUS, 0);
 }
 
 static bool planting_start_init_from_nvs_or_rtc(void) {
@@ -1455,12 +1598,10 @@ static bool planting_start_save_verified(time_t epoch, const char *cmd_id) {
     return true;
 }
 
-static void handle_planting_start_command(esp_mqtt_event_handle_t ev) {
-    char payload[320];
+static void handle_planting_start_payload(const char *payload) {
     char action[24] = {0};
     char cmd_id[PLANTING_CMD_ID_MAX] = {0};
     char reason[64] = {0};
-    mqtt_data_to_cstr(ev, payload, sizeof(payload));
 
     json_get_string_value(payload, "command_id", cmd_id, sizeof(cmd_id));
     if (!cmd_id[0]) json_get_string_value(payload, "id", cmd_id, sizeof(cmd_id));
@@ -1553,7 +1694,7 @@ static void publish_actuator_state(const char *event_reason) {
         snap.light_reason[0] ? snap.light_reason : "UNKNOWN");
 
     if (len > 0) {
-        esp_mqtt_client_publish(s_mqtt, TOPIC_ACTUATOR_STATE, payload, len, MQTT_QOS, 0);
+        esp_mqtt_client_publish(s_mqtt, TOPIC_ACTUATOR_STATE, payload, len, MQTT_QOS_STATUS, 0);
     }
 }
 
@@ -1577,10 +1718,7 @@ static void set_light_state(bool on, const char *mode, const char *reason) {
     }
 }
 
-static void handle_auto_pump_command(esp_mqtt_event_handle_t ev) {
-    char payload[256];
-    mqtt_data_to_cstr(ev, payload, sizeof(payload));
-
+static void handle_auto_pump_payload(const char *payload) {
     if (pump_direct_active()) {
         ESP_LOGW(TAG, "Ignore Gateway auto pump while direct command active: %s", payload);
         return;
@@ -1613,16 +1751,30 @@ static void handle_auto_pump_command(esp_mqtt_event_handle_t ev) {
     publish_actuator_state("GATEWAY_CMD_PUMP");
 }
 
-static void handle_dt_pump_command(esp_mqtt_event_handle_t ev) {
-    char payload[256];
+static void handle_dt_pump_payload(const char *payload) {
     char reason[32] = {0};
     char cmd_id[DIRECT_CMD_ID_MAX] = {0};
-    mqtt_data_to_cstr(ev, payload, sizeof(payload));
 
     json_get_string_value(payload, "command_id", cmd_id, sizeof(cmd_id));
     if (!cmd_id[0]) json_get_string_value(payload, "id", cmd_id, sizeof(cmd_id));
+    reset_saturated_last_seq_if_needed("pump");
+    int incoming_seq = json_get_int_value(payload, "seq", 0);
+    if (incoming_seq > 0 && incoming_seq_is_invalid_saturated(incoming_seq, cmd_id, "pump")) {
+        publish_actuator_state("DROP_SATURATED_PUMP_CMD");
+        return;
+    }
+    if (incoming_seq > 0 && s_last_pump_cmd_seq > 0 && incoming_seq < s_last_pump_cmd_seq) {
+        ESP_LOGW(TAG, "Drop old pump command cmd_id=%s seq=%d < last_seq=%d",
+                 cmd_id[0] ? cmd_id : "NONE", incoming_seq, s_last_pump_cmd_seq);
+        publish_actuator_state("DROP_OLD_PUMP_CMD");
+        return;
+    }
+    if (command_payload_expired(payload, cmd_id)) {
+        publish_actuator_state("DROP_EXPIRED_PUMP_CMD");
+        return;
+    }
     if (cmd_id[0]) strlcpy(s_last_pump_cmd_id, cmd_id, sizeof(s_last_pump_cmd_id));
-    s_last_pump_cmd_seq = json_get_int_value(payload, "seq", s_last_pump_cmd_seq);
+    if (incoming_seq > 0) s_last_pump_cmd_seq = incoming_seq;
 
     bool on = parse_on_off_command(payload, false);
     int duration_s = parse_duration_s(payload, DT_PUMP_DEFAULT_DURATION_S, DT_PUMP_MAX_DURATION_S);
@@ -1644,16 +1796,30 @@ static void handle_dt_pump_command(esp_mqtt_event_handle_t ev) {
     publish_actuator_state("DT_CMD_PUMP");
 }
 
-static void handle_dt_light_command(esp_mqtt_event_handle_t ev, const char *mode_name) {
-    char payload[256];
+static void handle_dt_light_payload(const char *payload, const char *mode_name) {
     char reason[32] = {0};
     char cmd_id[DIRECT_CMD_ID_MAX] = {0};
-    mqtt_data_to_cstr(ev, payload, sizeof(payload));
 
     json_get_string_value(payload, "command_id", cmd_id, sizeof(cmd_id));
     if (!cmd_id[0]) json_get_string_value(payload, "id", cmd_id, sizeof(cmd_id));
+    reset_saturated_last_seq_if_needed("light");
+    int incoming_seq = json_get_int_value(payload, "seq", 0);
+    if (incoming_seq > 0 && incoming_seq_is_invalid_saturated(incoming_seq, cmd_id, "light")) {
+        publish_actuator_state("DROP_SATURATED_LIGHT_CMD");
+        return;
+    }
+    if (incoming_seq > 0 && s_last_light_cmd_seq > 0 && incoming_seq < s_last_light_cmd_seq) {
+        ESP_LOGW(TAG, "Drop old light command cmd_id=%s seq=%d < last_seq=%d",
+                 cmd_id[0] ? cmd_id : "NONE", incoming_seq, s_last_light_cmd_seq);
+        publish_actuator_state("DROP_OLD_LIGHT_CMD");
+        return;
+    }
+    if (command_payload_expired(payload, cmd_id)) {
+        publish_actuator_state("DROP_EXPIRED_LIGHT_CMD");
+        return;
+    }
     if (cmd_id[0]) strlcpy(s_last_light_cmd_id, cmd_id, sizeof(s_last_light_cmd_id));
-    s_last_light_cmd_seq = json_get_int_value(payload, "seq", s_last_light_cmd_seq);
+    if (incoming_seq > 0) s_last_light_cmd_seq = incoming_seq;
 
     bool on = parse_on_off_command(payload, false);
     int duration_s = parse_duration_s(payload, DT_LIGHT_DEFAULT_DURATION_S, DT_LIGHT_MAX_DURATION_S);
@@ -1958,6 +2124,24 @@ static void wifi_init(void) {
         ESP_LOGW(TAG, "set_country(VN) lỗi mềm: %s", esp_err_to_name(country_err));
     }
 
+    /* v2.9.8: tăng ổn định WiFi/MQTT khi ESP32 gửi nhận liên tục.
+     * - WIFI_PS_NONE: không ngủ WiFi, giảm No PING_RESP / MQTT disconnect.
+     * - max_tx_power=78 tương đương 19.5 dBm, mức cao nhất thường dùng của ESP32.
+     */
+    esp_err_t ps_err = esp_wifi_set_ps(WIFI_PS_NONE);
+    if (ps_err != ESP_OK) {
+        ESP_LOGW(TAG, "esp_wifi_set_ps(WIFI_PS_NONE) lỗi mềm: %s", esp_err_to_name(ps_err));
+    } else {
+        ESP_LOGI(TAG, "WiFi power save: OFF");
+    }
+
+    esp_err_t txp_err = esp_wifi_set_max_tx_power(78);
+    if (txp_err != ESP_OK) {
+        ESP_LOGW(TAG, "esp_wifi_set_max_tx_power(78) lỗi mềm: %s", esp_err_to_name(txp_err));
+    } else {
+        ESP_LOGI(TAG, "WiFi TX power: max request=78/19.5dBm");
+    }
+
     /* Đặt cấu hình mặc định trước khi start. */
     wifi_apply_config(s_current_wifi_index);
 
@@ -1981,6 +2165,69 @@ static void wifi_init(void) {
     }
 }
 
+
+/* ================================================================
+   ACTUATOR COMMAND QUEUE — REALTIME CONTROL PATH v2.9.6
+   ================================================================ */
+
+static void enqueue_mqtt_command(cmd_kind_t kind, esp_mqtt_event_handle_t ev) {
+    if (!s_cmd_queue || !ev || !ev->data) return;
+
+    cmd_msg_t msg = {0};
+    msg.kind = kind;
+    msg.rx_us = esp_timer_get_time();
+
+    size_t n = (ev->data_len < (int)(sizeof(msg.payload) - 1)) ? ev->data_len : (sizeof(msg.payload) - 1);
+    memcpy(msg.payload, ev->data, n);
+    msg.payload[n] = '\0';
+
+    if (xQueueSend(s_cmd_queue, &msg, 0) != pdTRUE) {
+        cmd_msg_t dropped;
+        (void)xQueueReceive(s_cmd_queue, &dropped, 0);
+        if (xQueueSend(s_cmd_queue, &msg, 0) != pdTRUE) {
+            ESP_LOGE(TAG, "CMD_QUEUE full: drop newest kind=%d payload=%s", (int)kind, msg.payload);
+        } else {
+            ESP_LOGW(TAG, "CMD_QUEUE full: dropped oldest, queued newest kind=%d", (int)kind);
+        }
+    }
+}
+
+static void actuator_cmd_task(void *pv) {
+    ESP_LOGI(TAG, "actuator_cmd_task running on core %d prio=%d queue_len=%d",
+             xPortGetCoreID(), (int)uxTaskPriorityGet(NULL), CMD_QUEUE_LEN);
+
+    cmd_msg_t msg;
+    while (1) {
+        if (xQueueReceive(s_cmd_queue, &msg, portMAX_DELAY) != pdTRUE) continue;
+
+        int64_t q_delay_ms = (esp_timer_get_time() - msg.rx_us) / 1000LL;
+        if (q_delay_ms > 100) {
+            ESP_LOGW(TAG, "CMD_QUEUE delay kind=%d delay=%lldms payload=%s",
+                     (int)msg.kind, (long long)q_delay_ms, msg.payload);
+        }
+
+        switch (msg.kind) {
+            case CMD_KIND_AUTO_PUMP:
+                handle_auto_pump_payload(msg.payload);
+                break;
+            case CMD_KIND_DIRECT_PUMP:
+                handle_dt_pump_payload(msg.payload);
+                break;
+            case CMD_KIND_DIRECT_LIGHT:
+                handle_dt_light_payload(msg.payload, "DIRECT_DT");
+                break;
+            case CMD_KIND_PLANTING_START:
+                handle_planting_start_payload(msg.payload);
+                break;
+            default:
+                ESP_LOGW(TAG, "CMD_QUEUE unknown kind=%d", (int)msg.kind);
+                break;
+        }
+
+        taskYIELD();
+    }
+}
+
 /* ================================================================
    MQTT EVENT HANDLER
    ================================================================ */
@@ -1990,10 +2237,10 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
     switch ((esp_mqtt_event_id_t)id) {
         case MQTT_EVENT_CONNECTED:
             s_mqtt_connected = true;
-            esp_mqtt_client_subscribe(s_mqtt, TOPIC_CMD_PUMP_AUTO, MQTT_QOS);
-            esp_mqtt_client_subscribe(s_mqtt, TOPIC_CMD_PUMP_DIRECT, MQTT_QOS);
-            esp_mqtt_client_subscribe(s_mqtt, TOPIC_CMD_LIGHT_DIRECT, MQTT_QOS);
-            esp_mqtt_client_subscribe(s_mqtt, TOPIC_CMD_PLANTING_START, MQTT_QOS);
+            esp_mqtt_client_subscribe(s_mqtt, TOPIC_CMD_PUMP_AUTO, MQTT_QOS_COMMAND);
+            esp_mqtt_client_subscribe(s_mqtt, TOPIC_CMD_PUMP_DIRECT, MQTT_QOS_COMMAND);
+            esp_mqtt_client_subscribe(s_mqtt, TOPIC_CMD_LIGHT_DIRECT, MQTT_QOS_COMMAND);
+            esp_mqtt_client_subscribe(s_mqtt, TOPIC_CMD_PLANTING_START, MQTT_QOS_COMMAND);
             ESP_LOGI(TAG,
                      "MQTT connected %s:%d — sub: auto/pump, direct/pump, direct/light, config/planting_start | buffer=%d/%d",
                      MQTT_BROKER_URI, MQTT_PORT, ring_count(), RING_BUF_SIZE);
@@ -2002,23 +2249,23 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
             break;
         case MQTT_EVENT_DISCONNECTED:
             s_mqtt_connected = false;
-            ESP_LOGW(TAG, "MQTT mất kết nối — buffering ON | broker=%s:%d | buffer=%d/%d",
-                     MQTT_BROKER_URI, MQTT_PORT, ring_count(), RING_BUF_SIZE);
+            ESP_LOGW(TAG, "MQTT mất kết nối — telemetry realtime sẽ drop, command/ACK giữ QoS1 | broker=%s:%d",
+                     MQTT_BROKER_URI, MQTT_PORT);
             break;
         case MQTT_EVENT_ERROR:
             s_mqtt_connected = false;
-            ESP_LOGE(TAG, "MQTT_EVENT_ERROR — chưa kết nối được broker/Raspberry Pi Gateway? broker=%s:%d | buffer=%d/%d",
-                     MQTT_BROKER_URI, MQTT_PORT, ring_count(), RING_BUF_SIZE);
+            ESP_LOGE(TAG, "MQTT_EVENT_ERROR — broker/Raspberry Pi Gateway chưa ổn? broker=%s:%d",
+                     MQTT_BROKER_URI, MQTT_PORT);
             break;
         case MQTT_EVENT_DATA:
             if (mqtt_topic_match(ev, TOPIC_CMD_PUMP_AUTO)) {
-                handle_auto_pump_command(ev);
+                enqueue_mqtt_command(CMD_KIND_AUTO_PUMP, ev);
             } else if (mqtt_topic_match(ev, TOPIC_CMD_PUMP_DIRECT)) {
-                handle_dt_pump_command(ev);
+                enqueue_mqtt_command(CMD_KIND_DIRECT_PUMP, ev);
             } else if (mqtt_topic_match(ev, TOPIC_CMD_LIGHT_DIRECT)) {
-                handle_dt_light_command(ev, "DIRECT_DT");
+                enqueue_mqtt_command(CMD_KIND_DIRECT_LIGHT, ev);
             } else if (mqtt_topic_match(ev, TOPIC_CMD_PLANTING_START)) {
-                handle_planting_start_command(ev);
+                enqueue_mqtt_command(CMD_KIND_PLANTING_START, ev);
             }
             break;
         default: break;
@@ -2086,8 +2333,14 @@ static void hw_init(void) {
  * @brief Task: Đọc tuần hoàn dữ liệu từ toàn bộ mảng cảm biến.
  */
 static void sensor_task(void *pv) {
-    ESP_LOGI(TAG, "sensor_task running on core %d", xPortGetCoreID());
+    ESP_LOGI(TAG, "sensor_task running on core %d prio=%d | SENSOR_READ_MS=%d DHT11_READ_MS=%d",
+             xPortGetCoreID(), (int)uxTaskPriorityGet(NULL), SENSOR_READ_MS, DHT11_READ_MS);
     dht11_t dht = { .dht11_pin = DHT11_GPIO };
+    float dht_cached_t = 0.0f;
+    float dht_cached_h = 0.0f;
+    bool dht_cache_valid = false;
+    int dht_fail_streak = 0;
+    int64_t last_dht_read_us = -((int64_t)DHT11_READ_MS * 1000LL);
     i2c_dev_t bh_dev = {0};
     bool bh_ready = false, ads_ready = false;
 
@@ -2126,15 +2379,38 @@ static void sensor_task(void *pv) {
         rtc_get_iso(snap.iso_time, sizeof(snap.iso_time));
         snap.rtc_ok = (snap.iso_time[0] == '2');
 
-        if (dht11_read(&dht, 3) == 0) {
-            float ft, fh;
-            dht11_moving_avg(dht.temperature, dht.humidity, &ft, &fh);
-            snap.temperature = ft; snap.air_humidity = fh; snap.dht11_ok = true;
-        } else {
-            if (xSemaphoreTake(s_sensor_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                snap.temperature = g_sensor.temperature; snap.air_humidity = g_sensor.air_humidity;
-                xSemaphoreGive(s_sensor_mutex);
+        int64_t now_us = esp_timer_get_time();
+        if ((now_us - last_dht_read_us) >= ((int64_t)DHT11_READ_MS * 1000LL)) {
+            last_dht_read_us = now_us;
+            if (dht11_read(&dht, 3) == 0 &&
+                dht.temperature > 0.0f && dht.temperature <= 60.0f &&
+                dht.humidity > 0.0f && dht.humidity <= 100.0f) {
+                float ft, fh;
+                dht11_moving_avg(dht.temperature, dht.humidity, &ft, &fh);
+                dht_cached_t = ft;
+                dht_cached_h = fh;
+                dht_cache_valid = true;
+                dht_fail_streak = 0;
+            } else {
+                dht_fail_streak++;
+                if (dht_fail_streak <= 3 || (dht_fail_streak % 10) == 0) {
+                    ESP_LOGW(TAG, "DHT11 checksum/read fail streak=%d -> %s",
+                             dht_fail_streak,
+                             dht_cache_valid ? "use last valid cache" : "NO valid cache yet");
+                }
             }
+        }
+
+        if (dht_cache_valid) {
+            snap.temperature = dht_cached_t;
+            snap.air_humidity = dht_cached_h;
+            /* lỗi 1-2 lần vẫn xem là usable vì đang dùng cache gần nhất; >2 lần báo dht11_ok=false. */
+            snap.dht11_ok = (dht_fail_streak <= 2);
+        } else {
+            /* v2.9.8.3: chưa từng đọc được DHT thì không copy g_sensor=0 cũ. */
+            snap.temperature = -1.0f;
+            snap.air_humidity = -1.0f;
+            snap.dht11_ok = false;
         }
 
         if (bh_ready) {
@@ -2352,9 +2628,9 @@ static void actuator_state_task(void *pv) {
  * @brief Task: Xuất dữ liệu lên MQTT và giải phóng bộ đệm (Drain Buffer).
  */
 static void publish_task(void *pv) {
-    ESP_LOGI(TAG, "publish_task running on core %d", xPortGetCoreID());
+    ESP_LOGI(TAG, "publish_task running on core %d | telemetry QoS0=%d | no sensors/latest",
+             xPortGetCoreID(), MQTT_QOS_TELEMETRY);
     static char json_buf[JSON_MAX_LEN];
-    static char drain_buf[JSON_MAX_LEN];
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(MQTT_PUBLISH_MS));
@@ -2368,37 +2644,26 @@ static void publish_task(void *pv) {
         int len = build_json(json_buf, sizeof(json_buf), &snap, s_step);
         if (len <= 0) continue;
 
-        int ring_before = ring_count();
         if (s_mqtt_connected) {
-            int msg_id = esp_mqtt_client_publish(s_mqtt, TOPIC_SENSOR, json_buf, len, MQTT_QOS, 0);
+            /* v2.9.7: telemetry realtime 1s dùng QoS0 để không chặn socket MQTT.
+             * Nếu mất 1 gói sensor thì Web/Unity nhận gói kế tiếp; command/ACK vẫn QoS1.
+             */
+            int msg_id = esp_mqtt_client_publish(s_mqtt, TOPIC_SENSOR, json_buf, len, MQTT_QOS_TELEMETRY, 0);
             if (msg_id < 0) {
-                ESP_LOGW(TAG, "Publish fail step=%d — lưu buffer", s_step);
-                ring_push(json_buf);
-            } else {
-                ESP_LOGI(TAG, "PUBLISH step=%d msg_id=%d len=%d phase=%d soil=%.1f%% light=%s buffer=%d/%d",
+                ESP_LOGW(TAG, "TELEMETRY drop step=%d — publish QoS0 fail, không lưu ring để tránh nghẽn", s_step);
+            } else if ((s_step % SENSOR_LOG_EVERY_N) == 0) {
+                ESP_LOGI(TAG, "PUBLISH_QOS0 step=%d msg_id=%d len=%d phase=%d soil=%.1f%% light=%s",
                          s_step, msg_id, len, snap.phase, soil_avg_from_snapshot(&snap),
-                         snap.light_state ? "ON" : "OFF", ring_before, RING_BUF_SIZE);
-            }
-
-            int drained = 0;
-            while (s_mqtt_connected && ring_count() > 0 && drained < DRAIN_MAX_PER_CYCLE) {
-                if (!ring_peek(drain_buf)) break;
-                if (esp_mqtt_client_publish(s_mqtt, TOPIC_SENSOR, drain_buf, strlen(drain_buf), MQTT_QOS, 0) >= 0) {
-                    ring_pop();
-                    drained++;
-                } else break;
-                vTaskDelay(pdMS_TO_TICKS(200));
-            }
-            if (drained > 0) {
-                ESP_LOGI(TAG, "DRAIN buffer: đã gửi lại %d packet, còn %d/%d",
-                         drained, ring_count(), RING_BUF_SIZE);
+                         snap.light_state ? "ON" : "OFF");
             }
         } else {
+#if TELEMETRY_RING_ENABLE
             ring_push(json_buf);
-            if ((s_step % OFFLINE_LOG_EVERY_N) == 0 || ring_count() == 1) {
-                ESP_LOGW(TAG, "OFFLINE step=%d — Raspberry Pi Gateway/MQTT chưa sẵn sàng, lưu packet vào ring buffer %d/%d",
-                         s_step, ring_count(), RING_BUF_SIZE);
+#else
+            if ((s_step % OFFLINE_LOG_EVERY_N) == 0) {
+                ESP_LOGW(TAG, "OFFLINE step=%d — drop telemetry realtime, không buffer để giữ MQTT nhẹ", s_step);
             }
+#endif
         }
     }
 }
@@ -2427,6 +2692,10 @@ void app_main(void) {
     setenv("TZ", TZ_INFO_UTC7, 1);
     tzset();
     ring_init();
+    s_cmd_queue = xQueueCreate(CMD_QUEUE_LEN, sizeof(cmd_msg_t));
+    if (!s_cmd_queue) {
+        ESP_LOGE(TAG, "Không tạo được command queue");
+    }
     hw_init();
     wifi_init();
 
@@ -2449,16 +2718,17 @@ void app_main(void) {
 
     mqtt_init();
 
-    /* Core pinning:
-     * CORE_NET: MQTT publish + NTP
-     * CORE_APP: Sensor + RTC phase/light + actuator safety
+    /* Core pinning v2.9.6:
+     * CORE_NET: MQTT publish + NTP.
+     * CORE_APP: actuator_cmd_task priority cao nhất; sensor/DHT không được chặn command.
      */
-    xTaskCreatePinnedToCore(ntp_rtc_sync_task,   "ntp_rtc", 4096, NULL, 3, NULL, CORE_NET);
-    xTaskCreatePinnedToCore(publish_task,        "publish",  4096, NULL, 3, NULL, CORE_NET);
+    xTaskCreatePinnedToCore(ntp_rtc_sync_task,   "ntp_rtc", 4096, NULL, PRIO_NTP_RTC, NULL, CORE_NET);
+    xTaskCreatePinnedToCore(publish_task,        "publish",  4096, NULL, PRIO_PUBLISH, NULL, CORE_NET);
 
-    xTaskCreatePinnedToCore(sensor_task,         "sensor",   4096, NULL, 5, NULL, CORE_APP);
-    xTaskCreatePinnedToCore(light_schedule_task, "light",    3072, NULL, 4, NULL, CORE_APP);
-    xTaskCreatePinnedToCore(actuator_state_task, "act_state",4096, NULL, 4, NULL, CORE_APP);
+    xTaskCreatePinnedToCore(actuator_cmd_task,   "act_cmd",  4096, NULL, PRIO_ACTUATOR_CMD, NULL, CORE_APP);
+    xTaskCreatePinnedToCore(actuator_state_task, "act_state",4096, NULL, PRIO_ACTUATOR_STATE, NULL, CORE_APP);
+    xTaskCreatePinnedToCore(light_schedule_task, "light",    3072, NULL, PRIO_LIGHT_SCHEDULE, NULL, CORE_APP);
+    xTaskCreatePinnedToCore(sensor_task,         "sensor",   4096, NULL, PRIO_SENSOR, NULL, CORE_APP);
 
-    ESP_LOGI(TAG, "Tất cả tasks đã khởi động (RTC phase owner + Multi-WiFi + DT direct actuator)");
+    ESP_LOGI(TAG, "Tất cả tasks đã khởi động v2.9.7 (QoS split: telemetry QoS0, command/ACK QoS1, latest retain QoS1)");
 }

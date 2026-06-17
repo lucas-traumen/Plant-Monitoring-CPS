@@ -1,6 +1,6 @@
 /*
  * Plant Monitoring CPS Web UI
- * Version: v1.3.0-web-first-command-controller
+ * Version: v1.3.5-int32-safe-epoch-seq-ui
  *
  * Web chạy trước:
  * - GET /api/realtime/latest để hiện dữ liệu tức thời từ RAM cache.
@@ -12,7 +12,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
 
-const APP_VERSION = "1.3.0-web-first-command-controller";
+const APP_VERSION = "1.3.5-int32-safe-epoch-seq-ui";
 
 function makeEndpoints() {
   const protocol = window.location.protocol === "https:" ? "https:" : "http:";
