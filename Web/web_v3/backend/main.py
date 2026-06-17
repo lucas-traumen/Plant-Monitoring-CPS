@@ -1,13 +1,18 @@
 """
-main.py — Plant Monitoring CPS Backend v1.2.0-realtime-mqtt
-================================================================
+Plant Monitoring CPS Backend
+Version: v1.3.0-web-first-command-controller
 
-New architecture:
-- Realtime path: ESP32 -> MQTT -> Gateway -> Backend ingest -> WebSocket -> Web/Unity.
-- Storage path : Gateway/Backend -> HTTPS -> InfluxDB Cloud.
-- Command path : Web/Unity -> Backend -> MQTT immediately, and command log to InfluxDB.
+Mục tiêu bản v1.3.0:
+- Web chạy trước, Unity dùng lại cùng API/WebSocket qua Tailscale.
+- Realtime không phụ thuộc InfluxDB: Gateway -> /api/realtime/ingest -> RAM cache -> WebSocket.
+- Command Pump/Light chống spam bằng debounce + rate-limit + coalesce latest command.
+- Command dùng MQTT QoS1 + command_id + seq + ACK/retry/timeout ở tầng ứng dụng.
+- Planting Start dùng retained MQTT command cho đến khi ESP32 ACK, sau đó clear retained payload.
 
-InfluxDB is used for history/audit/recovery. It is not the mandatory realtime bus.
+Flow:
+ESP32 -> MQTT -> Gateway -> Backend ingest -> WebSocket -> Web/Unity
+Web/Unity -> Backend command controller -> MQTT QoS1 -> ESP32 -> ACK/state -> Backend -> Web/Unity
+InfluxDB chỉ dùng cho history/log/recovery, không làm realtime bus.
 """
 
 from __future__ import annotations
@@ -18,6 +23,7 @@ import os
 import time
 import uuid
 from collections import deque
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from io import StringIO
 from typing import Any, Literal
@@ -39,7 +45,7 @@ from pydantic import BaseModel, Field
 
 load_dotenv()
 
-API_VERSION = "1.2.0-realtime-mqtt"
+API_VERSION = "1.3.0-web-first-command-controller"
 NODE_ID = os.getenv("NODE_ID", "BRASSICA_JUNCEA_01")
 NODE_TOPIC_ID = os.getenv("NODE_TOPIC_ID", "brassica_01")
 PLANT_NAME = os.getenv("PLANT_NAME", "Rau Cải Mầm (Brassica juncea)")
@@ -59,7 +65,7 @@ TOPICS = {
 MQTT_BROKER = os.getenv("MQTT_BROKER", "127.0.0.1")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
 MQTT_QOS = int(os.getenv("MQTT_QOS", "1"))
-MQTT_CLIENT_ID = os.getenv("MQTT_CLIENT_ID", "plant_backend_realtime_mqtt")
+MQTT_CLIENT_ID = os.getenv("MQTT_CLIENT_ID", "plant_backend_v1_3_0")
 
 INFLUX_URL = os.getenv("INFLUX_URL") or os.getenv("INFLUXDB_URL") or "https://us-east-1-1.aws.cloud2.influxdata.com"
 INFLUX_TOKEN = os.getenv("INFLUX_TOKEN") or os.getenv("INFLUXDB_TOKEN") or ""
@@ -67,25 +73,33 @@ INFLUX_ORG = os.getenv("INFLUX_ORG") or os.getenv("INFLUXDB_ORG") or "DEV_TEAM"
 INFLUX_BUCKET = os.getenv("INFLUX_BUCKET") or os.getenv("INFLUXDB_BUCKET") or "digital_twin_data"
 
 REALTIME_INGEST_TOKEN = os.getenv("REALTIME_INGEST_TOKEN", "")
-COMMAND_MODE = os.getenv("COMMAND_MODE", "mqtt_direct").strip().lower()
-# mqtt_direct: Backend publishes MQTT immediately and logs dt status=SENT.
-# db_queue   : Backend only writes dt status=PENDING; Gateway polls DB and sends MQTT.
+
+COMMAND_ACK_TIMEOUT_S = float(os.getenv("COMMAND_ACK_TIMEOUT_S", "3.0"))
+COMMAND_MAX_RETRIES = int(os.getenv("COMMAND_MAX_RETRIES", "3"))
+COMMAND_RETRY_SCAN_S = float(os.getenv("COMMAND_RETRY_SCAN_S", "0.25"))
+COMMAND_TTL_S = float(os.getenv("COMMAND_TTL_S", "15.0"))
+
+PUMP_DEBOUNCE_MS = int(os.getenv("PUMP_DEBOUNCE_MS", "500"))
+LIGHT_DEBOUNCE_MS = int(os.getenv("LIGHT_DEBOUNCE_MS", "250"))
+PUMP_MIN_INTERVAL_S = float(os.getenv("PUMP_MIN_INTERVAL_S", "1.0"))
+LIGHT_MIN_INTERVAL_S = float(os.getenv("LIGHT_MIN_INTERVAL_S", "0.5"))
+PUMP_MAX_DURATION_S = int(os.getenv("PUMP_MAX_DURATION_S", "15"))
+LIGHT_MAX_DURATION_S = int(os.getenv("LIGHT_MAX_DURATION_S", "1800"))
 
 MEAS_SENSORS = "sensors"
 MEAS_STATUS = "status"
 MEAS_ACTUATOR = "actuator"
 MEAS_CMD = "cmd"
 MEAS_DT = "dt"
-
 WRITE_PRECISION_SECONDS = getattr(WritePrecision, "S", None) or getattr(WritePrecision, "SECONDS")
 
 # =============================================================================
-# APP + CORS
+# APP
 # =============================================================================
 
 app = FastAPI(
     title="Plant Monitoring CPS Web API",
-    description="Realtime MQTT/WebSocket backend with InfluxDB history for Plant Monitoring CPS.",
+    description="Web-first realtime MQTT/WebSocket backend with command controller.",
     version=API_VERSION,
 )
 
@@ -94,7 +108,6 @@ cors_origins_raw = os.getenv(
     "http://localhost:5173,http://127.0.0.1:5173,http://192.168.4.1:5173,http://10.42.0.217:5173,http://100.110.157.78:5173",
 )
 CORS_ORIGINS = [x.strip() for x in cors_origins_raw.split(",") if x.strip()]
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS or ["*"],
@@ -109,14 +122,14 @@ app.add_middleware(
 
 class PumpCommand(BaseModel):
     state: Literal["ON", "OFF"]
-    duration_s: int = Field(default=10, ge=0, le=15)
+    duration_s: int = Field(default=10, ge=0, le=PUMP_MAX_DURATION_S)
     reason: str = "web_manual"
     source: str = "web"
 
 
 class LightCommand(BaseModel):
     state: Literal["ON", "OFF"]
-    duration_s: int = Field(default=300, ge=0, le=1800)
+    duration_s: int = Field(default=300, ge=0, le=LIGHT_MAX_DURATION_S)
     reason: str = "web_manual"
     source: str = "web"
 
@@ -141,30 +154,35 @@ class RealtimeIngestEvent(BaseModel):
     status: str | None = None
 
 # =============================================================================
-# HELPERS
+# BASIC HELPERS
 # =============================================================================
 
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return utc_now().isoformat()
 
 
 def unix_now_s() -> int:
     return int(time.time())
 
 
-def make_command_id(source: str) -> str:
-    src = (source or "web").strip().lower().replace(" ", "_")[:16]
-    return f"{src}-{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}"
+def safe_upper(value: Any, default: str = "") -> str:
+    if value is None:
+        return default
+    return str(value).strip().upper() or default
 
 
-def check_env() -> None:
-    if not INFLUX_TOKEN:
-        raise HTTPException(status_code=500, detail="Missing INFLUX_TOKEN in backend .env")
+def model_to_dict(model: BaseModel) -> dict[str, Any]:
+    return model.model_dump() if hasattr(model, "model_dump") else model.dict()
 
 
-def get_client() -> InfluxDBClient:
-    check_env()
-    return InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG, timeout=30000)
+def make_command_id(source: str, target: str) -> str:
+    src = (source or "web").strip().lower().replace(" ", "_")[:12]
+    tgt = (target or "cmd").strip().lower().replace(" ", "_")[:16]
+    return f"{src}-{tgt}-{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}"
 
 
 def clean_value(value: Any) -> Any:
@@ -182,8 +200,6 @@ def clean_value(value: Any) -> Any:
         return value.isoformat()
     if isinstance(value, datetime):
         return value.isoformat()
-    if isinstance(value, (dict, list, tuple)):
-        return value
     try:
         if pd.isna(value):
             return None
@@ -192,71 +208,115 @@ def clean_value(value: Any) -> Any:
     return value
 
 
-def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+def dataframe_to_records(df: pd.DataFrame) -> list[dict[str, Any]]:
     if df.empty:
-        return df
+        return []
     for col in ("result", "table", "_start", "_stop"):
         if col in df.columns:
             df = df.drop(columns=[col])
     if "_time" in df.columns:
         df["_time"] = pd.to_datetime(df["_time"], errors="coerce").dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-    return df.replace({np.nan: None})
-
-
-def dataframe_to_records(df: pd.DataFrame) -> list[dict[str, Any]]:
-    df = normalize_dataframe(df)
+    df = df.replace({np.nan: None})
     return [{str(k): clean_value(v) for k, v in row.items()} for row in df.to_dict(orient="records")]
 
+# =============================================================================
+# INFLUXDB
+# =============================================================================
 
-def build_range_part(minutes: int | None = None, date: str | None = None) -> str:
+def check_influx_env() -> None:
+    if not INFLUX_TOKEN:
+        raise HTTPException(status_code=500, detail="Missing INFLUX_TOKEN / INFLUXDB_TOKEN in backend .env")
+
+
+def get_influx_client() -> InfluxDBClient:
+    check_influx_env()
+    return InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG, timeout=30000)
+
+
+def query_measurement(measurement: str, minutes: int = 30, date: str | None = None, limit: int = 300) -> list[dict[str, Any]]:
+    safe_limit = max(1, min(int(limit), 5000))
     if date:
         try:
             start = datetime.fromisoformat(date).replace(tzinfo=timezone.utc)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD") from exc
         stop = start + timedelta(days=1)
-        return f'|> range(start: {start.isoformat()}, stop: {stop.isoformat()})'
-    safe_minutes = int(minutes or 720)
-    safe_minutes = max(1, min(safe_minutes, 60 * 24 * 31))
-    return f"|> range(start: -{safe_minutes}m)"
+        range_part = f"|> range(start: {start.isoformat()}, stop: {stop.isoformat()})"
+    else:
+        safe_minutes = max(1, min(int(minutes), 60 * 24 * 31))
+        range_part = f"|> range(start: -{safe_minutes}m)"
 
-
-def query_measurement(measurement: str, minutes: int | None = 720, date: str | None = None, limit: int = 300) -> list[dict[str, Any]]:
-    range_part = build_range_part(minutes=minutes, date=date)
     flux = f'''
 from(bucket: "{INFLUX_BUCKET}")
   {range_part}
-  |> filter(fn: (r) => r._measurement == "{measurement}")
+  |> filter(fn: (r) => r["_measurement"] == "{measurement}")
   |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
-  |> sort(columns: ["_time"], desc: false)
-  |> limit(n: {int(limit)})
+  |> sort(columns: ["_time"])
+  |> tail(n: {safe_limit})
 '''
-    with get_client() as client:
-        df = client.query_api().query_data_frame(flux, org=INFLUX_ORG)
-    if isinstance(df, list):
-        df = pd.concat(df, ignore_index=True) if df else pd.DataFrame()
-    if df.empty:
-        return []
-    return dataframe_to_records(df)
+    try:
+        with get_influx_client() as client:
+            df = client.query_api().query_data_frame(org=INFLUX_ORG, query=flux)
+        if isinstance(df, list):
+            df = pd.concat(df, ignore_index=True) if df else pd.DataFrame()
+        if df is None or df.empty:
+            return []
+        return dataframe_to_records(df)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"InfluxDB query error: {exc}") from exc
 
 
-def parse_status_record(record: dict[str, Any] | None) -> dict[str, Any] | None:
-    if not record:
-        return None
-    value_json = record.get("value_json")
-    if isinstance(value_json, str):
-        try:
-            parsed = json.loads(value_json)
-            if isinstance(parsed, dict):
-                parsed.setdefault("_time", record.get("_time"))
-                parsed.setdefault("status_key", record.get("key"))
-                return parsed
-        except json.JSONDecodeError:
-            pass
-    return record
+def write_influx_point(point: Point) -> None:
+    try:
+        with get_influx_client() as client:
+            client.write_api(write_options=SYNCHRONOUS).write(bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=point)
+    except Exception as exc:
+        # Command realtime must not crash only because Cloud history is slow/down.
+        print(f"[WARN] Influx write failed: {exc}")
+
+
+def write_cmd_event(command_id: str, target: str, status: str, message: str = "", seq: int = 0) -> None:
+    point = (
+        Point(MEAS_CMD)
+        .tag("node_id", NODE_ID)
+        .tag("command_id", command_id)
+        .tag("target", target)
+        .tag("status", status)
+        .field("message", message or "")
+        .field("seq", int(seq or 0))
+        .time(utc_now(), WRITE_PRECISION_SECONDS)
+    )
+    write_influx_point(point)
+
+
+def write_dt_command_log(command: dict[str, Any], status: str, message: str = "") -> None:
+    target = str(command.get("target") or "unknown")
+    command_id = str(command.get("command_id") or command.get("id") or "")
+    point = (
+        Point(MEAS_DT)
+        .tag("node_id", NODE_ID)
+        .tag("command_id", command_id)
+        .tag("target", target)
+        .tag("status", status)
+        .field("source", str(command.get("source") or "web"))
+        .field("reason", str(command.get("reason") or ""))
+        .field("message", message or "")
+        .field("seq", int(command.get("seq") or 0))
+        .field("mqtt_topic", str(command.get("mqtt_topic") or ""))
+        .time(utc_now(), WRITE_PRECISION_SECONDS)
+    )
+    if target in ("pump", "light"):
+        point = point.field("state", str(command.get("state") or "")).field("duration_s", int(command.get("duration_s") or 0))
+    if target == "planting_start":
+        point = point.field("action", str(command.get("action") or ""))
+        if command.get("planting_start_epoch") is not None:
+            point = point.field("planting_start_epoch", int(command.get("planting_start_epoch") or 0))
+    write_influx_point(point)
 
 # =============================================================================
-# REALTIME CACHE + WEBSOCKET
+# WEBSOCKET + REALTIME CACHE
 # =============================================================================
 
 class ConnectionManager:
@@ -303,7 +363,7 @@ LATEST: dict[str, Any] = {
     "dt_command": None,
     "updated_at": None,
 }
-EVENT_BUFFER: deque[dict[str, Any]] = deque(maxlen=300)
+EVENT_BUFFER: deque[dict[str, Any]] = deque(maxlen=500)
 
 
 def flatten_sensor_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -312,8 +372,7 @@ def flatten_sensor_payload(payload: dict[str, Any]) -> dict[str, Any]:
     control = payload.get("control", {}) if isinstance(payload.get("control"), dict) else {}
     pump = control.get("pump", {}) if isinstance(control.get("pump"), dict) else {}
     light = control.get("light", {}) if isinstance(control.get("light"), dict) else {}
-
-    flat = {
+    return {
         "_time": payload.get("timestamp") or utc_now_iso(),
         "node_id": payload.get("node_id", NODE_ID),
         "plant": payload.get("plant", PLANT_NAME),
@@ -349,7 +408,6 @@ def flatten_sensor_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "light_mode": light.get("mode"),
         "light_reason": light.get("reason"),
     }
-    return flat
 
 
 def flatten_actuator_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -358,6 +416,13 @@ def flatten_actuator_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "_time": payload.get("timestamp") or utc_now_iso(),
         "node_id": payload.get("node_id", NODE_ID),
+        "event": payload.get("event"),
+        "command_id": payload.get("command_id") or payload.get("id"),
+        "seq": payload.get("seq"),
+        "last_pump_command_id": payload.get("last_pump_command_id"),
+        "last_pump_seq": payload.get("last_pump_seq"),
+        "last_light_command_id": payload.get("last_light_command_id"),
+        "last_light_seq": payload.get("last_light_seq"),
         "pump_state": pump.get("state"),
         "pump_mode": pump.get("mode"),
         "pump_reason": pump.get("reason"),
@@ -367,13 +432,412 @@ def flatten_actuator_payload(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def apply_realtime_event(event: dict[str, Any]) -> dict[str, Any]:
+def parse_status_record(record: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not record:
+        return None
+    value_json = record.get("value_json")
+    if isinstance(value_json, str):
+        try:
+            parsed = json.loads(value_json)
+            if isinstance(parsed, dict):
+                parsed.setdefault("_time", record.get("_time"))
+                parsed.setdefault("status_key", record.get("key"))
+                return parsed
+        except json.JSONDecodeError:
+            pass
+    return record
+
+# =============================================================================
+# MQTT PUBLISHER
+# =============================================================================
+
+mqtt_client: mqtt.Client | None = None
+mqtt_connected = False
+
+
+def mqtt_on_connect(client, userdata, flags, rc):
+    global mqtt_connected
+    mqtt_connected = (rc == 0)
+    print(f"[MQTT] connected={mqtt_connected} rc={rc}")
+
+
+def mqtt_on_disconnect(client, userdata, rc):
+    global mqtt_connected
+    mqtt_connected = False
+    print(f"[MQTT] disconnected rc={rc}")
+
+
+def init_mqtt() -> None:
+    global mqtt_client
+    mqtt_client = mqtt.Client(client_id=MQTT_CLIENT_ID, clean_session=True, protocol=mqtt.MQTTv311)
+    mqtt_client.on_connect = mqtt_on_connect
+    mqtt_client.on_disconnect = mqtt_on_disconnect
+    mqtt_client.reconnect_delay_set(min_delay=1, max_delay=20)
+    mqtt_client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
+    mqtt_client.loop_start()
+
+
+def publish_mqtt(topic: str, payload: dict[str, Any], retain: bool = False) -> None:
+    if mqtt_client is None:
+        raise HTTPException(status_code=503, detail="MQTT client is not initialized")
+    info = mqtt_client.publish(topic, json.dumps(payload, ensure_ascii=False), qos=MQTT_QOS, retain=retain)
+    info.wait_for_publish(timeout=2.0)
+    if info.rc != mqtt.MQTT_ERR_SUCCESS:
+        raise HTTPException(status_code=503, detail=f"MQTT publish failed rc={info.rc}")
+
+
+def clear_retained(topic: str) -> None:
+    if mqtt_client is None:
+        return
+    try:
+        info = mqtt_client.publish(topic, payload="", qos=MQTT_QOS, retain=True)
+        info.wait_for_publish(timeout=1.0)
+    except Exception as exc:
+        print(f"[WARN] clear retained failed topic={topic}: {exc}")
+
+# =============================================================================
+# COMMAND CONTROLLER
+# =============================================================================
+
+@dataclass
+class PendingCommand:
+    command_id: str
+    target: str
+    desired_state: str = ""
+    seq: int = 0
+    payload: dict[str, Any] = field(default_factory=dict)
+    topic: str = ""
+    retain: bool = False
+    source: str = "web"
+    reason: str = ""
+    created_monotonic: float = field(default_factory=time.monotonic)
+    sent_monotonic: float = 0.0
+    next_deadline: float = 0.0
+    retries: int = 0
+    status: str = "QUEUED"
+    last_error: str = ""
+
+
+COMMAND_LOCK = asyncio.Lock()
+PENDING_COMMANDS: dict[str, PendingCommand] = {}
+LATEST_DESIRED_BY_TARGET: dict[str, PendingCommand] = {}
+TARGET_TASKS: dict[str, asyncio.Task] = {}
+TARGET_LAST_SENT_AT: dict[str, float] = {"pump": 0.0, "light": 0.0, "planting_start": 0.0}
+TARGET_SEQ: dict[str, int] = {"pump": 0, "light": 0, "planting_start": 0}
+RETRY_TASK: asyncio.Task | None = None
+
+
+def topic_for_target(target: str) -> tuple[str, bool]:
+    if target == "pump":
+        return TOPICS["cmd_direct_pump"], False
+    if target == "light":
+        return TOPICS["cmd_direct_light"], False
+    if target == "planting_start":
+        return TOPICS["cmd_config_planting_start"], True
+    raise HTTPException(status_code=400, detail=f"Unsupported target={target}")
+
+
+def controller_config(target: str) -> tuple[float, float]:
+    if target == "pump":
+        return PUMP_DEBOUNCE_MS / 1000.0, PUMP_MIN_INTERVAL_S
+    if target == "light":
+        return LIGHT_DEBOUNCE_MS / 1000.0, LIGHT_MIN_INTERVAL_S
+    return 0.0, 0.0
+
+
+async def broadcast_event(event: dict[str, Any]) -> None:
+    EVENT_BUFFER.append(event)
+    await manager.broadcast(event)
+
+
+async def broadcast_command_status(cmd: PendingCommand, status: str, message: str = "") -> None:
+    event = {
+        "type": "command_event",
+        "source": "backend",
+        "timestamp": utc_now_iso(),
+        "command_id": cmd.command_id,
+        "target": cmd.target,
+        "status": status,
+        "message": message,
+        "data": {
+            **cmd.payload,
+            "status": status,
+            "message": message,
+            "retry_count": cmd.retries,
+            "mqtt_topic": cmd.topic,
+        },
+    }
+    LATEST["command_event"] = {
+        "_time": event["timestamp"],
+        "command_id": cmd.command_id,
+        "target": cmd.target,
+        "status": status,
+        "message": message,
+        "retry_count": cmd.retries,
+    }
+    LATEST["dt_command"] = {**cmd.payload, "status": status, "mqtt_topic": cmd.topic, "retry_count": cmd.retries}
+    LATEST["updated_at"] = event["timestamp"]
+    await broadcast_event(event)
+
+
+async def mark_command_done(cmd: PendingCommand, status: str = "DONE", message: str = "") -> None:
+    async with COMMAND_LOCK:
+        existing = PENDING_COMMANDS.pop(cmd.command_id, None)
+        if existing is None:
+            return
+        cmd.status = status
+    write_cmd_event(cmd.command_id, cmd.target, status, message, seq=cmd.seq)
+    write_dt_command_log({**cmd.payload, "mqtt_topic": cmd.topic}, status, message)
+    await broadcast_command_status(cmd, status, message)
+    if cmd.target == "planting_start" and cmd.retain and status in ("DONE", "DUPLICATE", "ERROR"):
+        clear_retained(cmd.topic)
+
+
+async def publish_pending_command(cmd: PendingCommand, first_send: bool = False) -> None:
+    try:
+        publish_mqtt(cmd.topic, cmd.payload, retain=cmd.retain)
+        cmd.sent_monotonic = time.monotonic()
+        cmd.next_deadline = cmd.sent_monotonic + COMMAND_ACK_TIMEOUT_S
+        cmd.status = "SENT" if first_send else "RETRY"
+        write_cmd_event(cmd.command_id, cmd.target, cmd.status, json.dumps(cmd.payload, ensure_ascii=False), seq=cmd.seq)
+        write_dt_command_log({**cmd.payload, "mqtt_topic": cmd.topic}, cmd.status)
+        await broadcast_command_status(cmd, cmd.status, "published to MQTT QoS1")
+    except Exception as exc:
+        cmd.status = "ERROR"
+        cmd.last_error = str(exc)
+        write_cmd_event(cmd.command_id, cmd.target, "ERROR", str(exc), seq=cmd.seq)
+        write_dt_command_log({**cmd.payload, "mqtt_topic": cmd.topic}, "ERROR", str(exc))
+        await broadcast_command_status(cmd, "ERROR", str(exc))
+        async with COMMAND_LOCK:
+            PENDING_COMMANDS.pop(cmd.command_id, None)
+
+
+async def delayed_send_for_target(target: str) -> None:
+    debounce_s, min_interval_s = controller_config(target)
+    if debounce_s > 0:
+        await asyncio.sleep(debounce_s)
+
+    async with COMMAND_LOCK:
+        cmd = LATEST_DESIRED_BY_TARGET.pop(target, None)
+    if cmd is None:
+        return
+
+    # Rate limit theo actuator để chống spam. Trong thời gian chờ, nếu có lệnh mới hơn thì ưu tiên lệnh mới.
+    wait_s = max(0.0, min_interval_s - (time.monotonic() - TARGET_LAST_SENT_AT.get(target, 0.0)))
+    if wait_s > 0:
+        await asyncio.sleep(wait_s)
+        async with COMMAND_LOCK:
+            newer = LATEST_DESIRED_BY_TARGET.pop(target, None)
+        if newer is not None:
+            await broadcast_command_status(cmd, "SUPERSEDED", f"replaced by newer {target} command before publish")
+            cmd = newer
+
+    TARGET_LAST_SENT_AT[target] = time.monotonic()
+    async with COMMAND_LOCK:
+        PENDING_COMMANDS[cmd.command_id] = cmd
+    await publish_pending_command(cmd, first_send=True)
+
+
+async def submit_coalesced_command(target: str, payload: dict[str, Any], source: str, reason: str) -> dict[str, Any]:
+    topic, retain = topic_for_target(target)
+    TARGET_SEQ[target] = TARGET_SEQ.get(target, 0) + 1
+    seq = TARGET_SEQ[target]
+    command_id = payload.get("command_id") or make_command_id(source, target)
+    payload = {
+        **payload,
+        "id": command_id,
+        "command_id": command_id,
+        "seq": seq,
+        "target": target,
+        "source": source,
+        "reason": reason,
+        "sent_at": utc_now_iso(),
+    }
+    cmd = PendingCommand(
+        command_id=command_id,
+        target=target,
+        desired_state=safe_upper(payload.get("state")),
+        seq=seq,
+        payload=payload,
+        topic=topic,
+        retain=retain,
+        source=source,
+        reason=reason,
+        status="QUEUED",
+    )
+
+    write_cmd_event(command_id, target, "QUEUED", json.dumps(payload, ensure_ascii=False), seq=seq)
+    write_dt_command_log({**payload, "mqtt_topic": topic}, "QUEUED")
+
+    async with COMMAND_LOCK:
+        old = LATEST_DESIRED_BY_TARGET.get(target)
+        LATEST_DESIRED_BY_TARGET[target] = cmd
+        task = TARGET_TASKS.get(target)
+        if task is not None and not task.done():
+            # Task hiện tại sẽ tự lấy latest sau debounce; không tạo task mới.
+            pass
+        else:
+            TARGET_TASKS[target] = asyncio.create_task(delayed_send_for_target(target))
+
+    if old is not None:
+        await broadcast_command_status(old, "SUPERSEDED", f"replaced by newer {target} command")
+    await broadcast_command_status(cmd, "QUEUED", "queued by command controller")
+
+    return {
+        "ok": True,
+        "api_version": API_VERSION,
+        "command_id": command_id,
+        "target": target,
+        "seq": seq,
+        "status": "QUEUED",
+        "mqtt_topic": topic,
+        "retain": retain,
+        "payload": payload,
+        "message": "Queued. Backend will debounce/rate-limit, publish MQTT QoS1, then wait ESP32 ACK/state.",
+    }
+
+
+async def submit_immediate_command(target: str, payload: dict[str, Any], source: str, reason: str) -> dict[str, Any]:
+    topic, retain = topic_for_target(target)
+    TARGET_SEQ[target] = TARGET_SEQ.get(target, 0) + 1
+    seq = TARGET_SEQ[target]
+    command_id = payload.get("command_id") or make_command_id(source, target)
+    payload = {
+        **payload,
+        "id": command_id,
+        "command_id": command_id,
+        "seq": seq,
+        "target": target,
+        "source": source,
+        "reason": reason,
+        "sent_at": utc_now_iso(),
+    }
+    cmd = PendingCommand(
+        command_id=command_id,
+        target=target,
+        desired_state=safe_upper(payload.get("state")),
+        seq=seq,
+        payload=payload,
+        topic=topic,
+        retain=retain,
+        source=source,
+        reason=reason,
+    )
+    async with COMMAND_LOCK:
+        PENDING_COMMANDS[command_id] = cmd
+    await broadcast_command_status(cmd, "QUEUED", "immediate command queued")
+    await publish_pending_command(cmd, first_send=True)
+    return {
+        "ok": True,
+        "api_version": API_VERSION,
+        "command_id": command_id,
+        "target": target,
+        "seq": seq,
+        "status": cmd.status,
+        "mqtt_topic": topic,
+        "retain": retain,
+        "payload": payload,
+    }
+
+
+async def retry_worker() -> None:
+    while True:
+        await asyncio.sleep(COMMAND_RETRY_SCAN_S)
+        now = time.monotonic()
+        todo_retry: list[PendingCommand] = []
+        todo_timeout: list[PendingCommand] = []
+        async with COMMAND_LOCK:
+            for cmd in list(PENDING_COMMANDS.values()):
+                if cmd.status not in ("SENT", "RETRY"):
+                    continue
+                if now - cmd.created_monotonic > COMMAND_TTL_S:
+                    todo_timeout.append(cmd)
+                    continue
+                if cmd.next_deadline and now >= cmd.next_deadline:
+                    if cmd.retries < COMMAND_MAX_RETRIES:
+                        cmd.retries += 1
+                        todo_retry.append(cmd)
+                    else:
+                        todo_timeout.append(cmd)
+        for cmd in todo_retry:
+            await publish_pending_command(cmd, first_send=False)
+        for cmd in todo_timeout:
+            await mark_command_done(cmd, "TIMEOUT", f"no ACK after {cmd.retries} retries")
+
+
+async def ack_direct_command_from_actuator(state: dict[str, Any]) -> None:
+    # Nếu firmware đã include command_id trong actuator_state thì ACK chính xác.
+    command_ids = [str(state.get("command_id") or "").strip()]
+    command_ids.append(str(state.get("last_pump_command_id") or "").strip())
+    command_ids.append(str(state.get("last_light_command_id") or "").strip())
+    for command_id in [x for x in command_ids if x]:
+        async with COMMAND_LOCK:
+            cmd = PENDING_COMMANDS.get(command_id)
+        if cmd and cmd.target in ("pump", "light"):
+            await mark_command_done(cmd, "DONE", "ESP32 actuator_state ACK with command_id")
+            return
+
+    # Backward compatible: firmware v2.9.3 chưa có command_id cho pump/light state,
+    # nên ACK theo state thật sau khi ESP32 publish actuator_state.
+    for target in ("pump", "light"):
+        actual = safe_upper(state.get(f"{target}_state"))
+        if actual not in ("ON", "OFF"):
+            continue
+        async with COMMAND_LOCK:
+            candidates = [c for c in PENDING_COMMANDS.values() if c.target == target and c.status in ("SENT", "RETRY")]
+        if not candidates:
+            continue
+        # Chỉ ACK command mới nhất của target, tránh command cũ đè command mới.
+        cmd = sorted(candidates, key=lambda c: c.seq)[-1]
+        if cmd.desired_state == actual:
+            await mark_command_done(cmd, "DONE", f"ESP32 actuator_state matches desired {target}={actual}")
+
+
+async def ack_planting_start_from_status(raw: dict[str, Any]) -> None:
+    command_id = str(raw.get("command_id") or raw.get("id") or "").strip()
+    if not command_id:
+        return
+    target = str(raw.get("target") or "").strip()
+    event = str(raw.get("event") or "").strip()
+    is_planting = target == "planting_start" or event.startswith("planting_start_")
+    if not is_planting:
+        return
+    status = safe_upper(raw.get("status"), "DONE")
+    final_status = "DONE" if status in ("DONE", "OK") else ("DUPLICATE" if status == "DUPLICATE" else "ERROR")
+    async with COMMAND_LOCK:
+        cmd = PENDING_COMMANDS.get(command_id)
+    if cmd:
+        await mark_command_done(cmd, final_status, json.dumps(raw, ensure_ascii=False))
+    else:
+        # ACK tới trễ sau timeout hoặc command do Gateway gửi. Vẫn broadcast để Web/Unity biết.
+        event_out = {
+            "type": "command_event",
+            "source": "backend",
+            "timestamp": utc_now_iso(),
+            "command_id": command_id,
+            "target": "planting_start",
+            "status": final_status,
+            "message": "late/external planting_start ACK",
+            "data": raw,
+        }
+        LATEST["command_event"] = {
+            "_time": event_out["timestamp"],
+            "command_id": command_id,
+            "target": "planting_start",
+            "status": final_status,
+            "message": json.dumps(raw, ensure_ascii=False),
+        }
+        LATEST["updated_at"] = event_out["timestamp"]
+        await broadcast_event(event_out)
+
+
+def apply_realtime_event_sync(event: dict[str, Any]) -> dict[str, Any]:
     etype = str(event.get("type") or "unknown")
     data = event.get("data") if isinstance(event.get("data"), dict) else {}
     received_at = utc_now_iso()
     event["received_at"] = received_at
-
     latest_patch: dict[str, Any] = {}
+
     if etype == "sensor":
         LATEST["sensors"] = flatten_sensor_payload(data)
         latest_patch["sensors"] = LATEST["sensors"]
@@ -385,23 +849,24 @@ def apply_realtime_event(event: dict[str, Any]) -> dict[str, Any]:
         status.setdefault("_time", data.get("timestamp") or received_at)
         LATEST["status"] = status
         latest_patch["status"] = status
-        if etype == "planting_start_ack":
+        if etype == "planting_start_ack" or str(status.get("event") or "").startswith("planting_start_"):
             LATEST["command_event"] = {
                 "_time": received_at,
-                "command_id": event.get("command_id") or data.get("command_id"),
+                "command_id": event.get("command_id") or status.get("command_id"),
                 "target": "planting_start",
-                "status": event.get("status") or data.get("status"),
-                "message": json.dumps(data, ensure_ascii=False),
+                "status": event.get("status") or status.get("status"),
+                "message": json.dumps(status, ensure_ascii=False),
             }
             latest_patch["command_event"] = LATEST["command_event"]
-    elif etype == "command_sent":
+    elif etype in ("command_event", "command_sent"):
         LATEST["command_event"] = {
             "_time": received_at,
             "command_id": event.get("command_id") or data.get("command_id"),
             "target": event.get("target") or data.get("target"),
-            "status": event.get("status") or "SENT",
-            "message": json.dumps(data, ensure_ascii=False),
+            "status": event.get("status") or data.get("status"),
+            "message": event.get("message") or json.dumps(data, ensure_ascii=False),
         }
+        LATEST["dt_command"] = data
         latest_patch["command_event"] = LATEST["command_event"]
 
     LATEST["updated_at"] = received_at
@@ -409,186 +874,23 @@ def apply_realtime_event(event: dict[str, Any]) -> dict[str, Any]:
     return latest_patch
 
 # =============================================================================
-# MQTT COMMAND PUBLISHER
-# =============================================================================
-
-mqtt_client: mqtt.Client | None = None
-mqtt_connected = False
-
-
-def mqtt_on_connect(client, userdata, flags, rc):
-    global mqtt_connected
-    mqtt_connected = (rc == 0)
-
-
-def mqtt_on_disconnect(client, userdata, rc):
-    global mqtt_connected
-    mqtt_connected = False
-
-
-def init_mqtt() -> None:
-    global mqtt_client
-    mqtt_client = mqtt.Client(client_id=MQTT_CLIENT_ID, clean_session=True, protocol=mqtt.MQTTv311)
-    mqtt_client.on_connect = mqtt_on_connect
-    mqtt_client.on_disconnect = mqtt_on_disconnect
-    mqtt_client.reconnect_delay_set(min_delay=2, max_delay=30)
-    mqtt_client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
-    mqtt_client.loop_start()
-
-
-def publish_mqtt(topic: str, payload: dict[str, Any], retain: bool = False) -> None:
-    if COMMAND_MODE == "db_queue":
-        return
-    if mqtt_client is None:
-        raise HTTPException(status_code=503, detail="MQTT client is not initialized")
-    info = mqtt_client.publish(topic, json.dumps(payload, ensure_ascii=False), qos=MQTT_QOS, retain=retain)
-    info.wait_for_publish(timeout=2.0)
-    if info.rc != mqtt.MQTT_ERR_SUCCESS:
-        raise HTTPException(status_code=503, detail=f"MQTT publish failed rc={info.rc}")
-
-# =============================================================================
-# INFLUX WRITES
-# =============================================================================
-
-def write_cmd_event(command_id: str, target: str, status: str, message: str = "") -> None:
-    point = (
-        Point(MEAS_CMD)
-        .tag("node_id", NODE_ID)
-        .tag("command_id", command_id)
-        .tag("target", target)
-        .tag("status", status)
-        .field("message", message)
-        .time(datetime.now(timezone.utc), WRITE_PRECISION_SECONDS)
-    )
-    with get_client() as client:
-        client.write_api(write_options=SYNCHRONOUS).write(bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=point)
-
-
-def write_dt_command_log(
-    command_id: str,
-    target: str,
-    status: str,
-    source: str,
-    reason: str,
-    state: str = "",
-    duration_s: int = 0,
-    action: str = "",
-    planting_start_epoch: int | None = None,
-    mqtt_topic: str = "",
-) -> None:
-    point = (
-        Point(MEAS_DT)
-        .tag("node_id", NODE_ID)
-        .tag("command_id", command_id)
-        .tag("target", target)
-        .tag("status", status)
-        .field("source", source or "web")
-        .field("reason", reason or "web_command")
-        .field("mqtt_topic", mqtt_topic)
-        .time(datetime.now(timezone.utc), WRITE_PRECISION_SECONDS)
-    )
-    if target == "planting_start":
-        point = point.field("action", action or "SET_EPOCH")
-        if planting_start_epoch:
-            point = point.field("planting_start_epoch", int(planting_start_epoch))
-    else:
-        point = point.field("state", state.upper()).field("duration_s", int(duration_s))
-    with get_client() as client:
-        client.write_api(write_options=SYNCHRONOUS).write(bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=point)
-
-async def broadcast_command(command: dict[str, Any]) -> None:
-    event = {
-        "type": "command_sent",
-        "source": "backend",
-        "timestamp": utc_now_iso(),
-        "data": command,
-        "command_id": command.get("command_id"),
-        "target": command.get("target"),
-        "status": command.get("status", "SENT"),
-        "latest": {
-            "command_event": {
-                "_time": utc_now_iso(),
-                "command_id": command.get("command_id"),
-                "target": command.get("target"),
-                "status": command.get("status", "SENT"),
-                "message": json.dumps(command, ensure_ascii=False),
-            },
-            "dt_command": command,
-        },
-    }
-    LATEST["command_event"] = event["latest"]["command_event"]
-    LATEST["dt_command"] = command
-    LATEST["updated_at"] = event["timestamp"]
-    EVENT_BUFFER.append(event)
-    await manager.broadcast(event)
-
-async def create_and_send_command(target: str, payload: dict[str, Any], source: str, reason: str) -> dict[str, Any]:
-    command_id = payload["command_id"]
-    topic = ""
-    retain = False
-
-    if target == "pump":
-        topic = TOPICS["cmd_direct_pump"]
-    elif target == "light":
-        topic = TOPICS["cmd_direct_light"]
-    elif target == "planting_start":
-        topic = TOPICS["cmd_config_planting_start"]
-        # SET_EPOCH/CLEAR are config state, retained for reconnect. GET is one-shot.
-        retain = payload.get("action") in ("SET_EPOCH", "CLEAR")
-    else:
-        raise HTTPException(status_code=400, detail=f"Unsupported target={target}")
-
-    status = "PENDING" if COMMAND_MODE == "db_queue" else "SENT"
-    try:
-        if COMMAND_MODE == "mqtt_direct":
-            publish_mqtt(topic, payload, retain=retain)
-        write_dt_command_log(
-            command_id=command_id,
-            target=target,
-            status=status,
-            source=source,
-            reason=reason,
-            state=payload.get("state", ""),
-            duration_s=int(payload.get("duration_s") or 0),
-            action=payload.get("action", ""),
-            planting_start_epoch=payload.get("planting_start_epoch"),
-            mqtt_topic=topic,
-        )
-        write_cmd_event(command_id, target, status, json.dumps(payload, ensure_ascii=False))
-    except Exception as exc:
-        try:
-            write_dt_command_log(command_id, target, "ERROR", source, str(exc), mqtt_topic=topic)
-            write_cmd_event(command_id, target, "ERROR", str(exc))
-        except Exception:
-            pass
-        raise
-
-    result = {
-        "ok": True,
-        "command_id": command_id,
-        "target": target,
-        "status": status,
-        "mode": COMMAND_MODE,
-        "mqtt_topic": topic,
-        "payload": payload,
-        "created_at": utc_now_iso(),
-        "message": "Command published to MQTT immediately and logged to InfluxDB." if COMMAND_MODE == "mqtt_direct" else "Command queued in InfluxDB dt. Gateway will poll and publish MQTT.",
-    }
-    await broadcast_command({**payload, "status": status, "mqtt_topic": topic})
-    return result
-
-# =============================================================================
 # STARTUP/SHUTDOWN
 # =============================================================================
 
 @app.on_event("startup")
 def on_startup() -> None:
+    global RETRY_TASK
     init_mqtt()
+    loop = asyncio.get_event_loop()
+    RETRY_TASK = loop.create_task(retry_worker())
+    print(f"[STARTUP] Plant backend {API_VERSION} started. MQTT={MQTT_BROKER}:{MQTT_PORT} QoS={MQTT_QOS}")
 
 
 @app.on_event("shutdown")
 def on_shutdown() -> None:
-    global mqtt_client
+    global mqtt_client, RETRY_TASK
+    if RETRY_TASK:
+        RETRY_TASK.cancel()
     if mqtt_client is not None:
         try:
             mqtt_client.loop_stop()
@@ -615,72 +917,31 @@ def root() -> dict[str, Any]:
 
 @app.get("/api/health")
 def health() -> dict[str, Any]:
-    check_env()
     influx_ok = False
-    try:
-        with get_client() as client:
-            influx_ok = bool(client.ping())
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"InfluxDB error: {exc}") from exc
+    influx_message = "disabled/missing token"
+    if INFLUX_TOKEN:
+        try:
+            with get_influx_client() as client:
+                influx_ok = bool(client.ping())
+                influx_message = "OK" if influx_ok else "ping false"
+        except Exception as exc:
+            influx_message = str(exc)
     return {
-        "status": "OK" if influx_ok else "ERROR",
+        "status": "OK",
         "api_version": API_VERSION,
         "node_id": NODE_ID,
         "node_topic_id": NODE_TOPIC_ID,
         "plant": PLANT_NAME,
-        "influx_url": INFLUX_URL,
-        "org": INFLUX_ORG,
-        "bucket": INFLUX_BUCKET,
-        "command_mode": COMMAND_MODE,
-        "mqtt": {"broker": MQTT_BROKER, "port": MQTT_PORT, "connected": mqtt_connected},
-        "websocket_clients": 0,  # set by /api/realtime/latest for async count
-        "measurements": [MEAS_SENSORS, MEAS_STATUS, MEAS_ACTUATOR, MEAS_CMD, MEAS_DT],
-        "topics_v2": TOPICS,
-        "timestamp": utc_now_iso(),
-    }
-
-
-@app.get("/api/dashboard/latest")
-def dashboard_latest(
-    minutes: int = Query(default=1440, ge=1, le=60 * 24 * 31),
-    date: str | None = Query(default=None),
-    prefer_realtime: bool = Query(default=True),
-) -> dict[str, Any]:
-    sensors_rows = query_measurement(MEAS_SENSORS, minutes=minutes, date=date, limit=500)
-    actuator_rows = query_measurement(MEAS_ACTUATOR, minutes=minutes, date=date, limit=500)
-    status_rows = query_measurement(MEAS_STATUS, minutes=minutes, date=date, limit=500)
-    cmd_rows = query_measurement(MEAS_CMD, minutes=minutes, date=date, limit=200)
-    dt_rows = query_measurement(MEAS_DT, minutes=minutes, date=date, limit=200)
-
-    sensors = sensors_rows[-1] if sensors_rows else None
-    actuator = actuator_rows[-1] if actuator_rows else None
-    status = parse_status_record(status_rows[-1]) if status_rows else None
-    command_event = cmd_rows[-1] if cmd_rows else None
-    dt_command = dt_rows[-1] if dt_rows else None
-
-    if prefer_realtime:
-        sensors = LATEST.get("sensors") or sensors
-        actuator = LATEST.get("actuator") or actuator
-        status = LATEST.get("status") or status
-        command_event = LATEST.get("command_event") or command_event
-        dt_command = LATEST.get("dt_command") or dt_command
-
-    return {
-        "node_id": NODE_ID,
-        "plant": PLANT_NAME,
-        "api_version": API_VERSION,
-        "realtime_updated_at": LATEST.get("updated_at"),
-        "sensors": sensors,
-        "actuator": actuator,
-        "status": status,
-        "command_event": command_event,
-        "dt_command": dt_command,
-        "counts": {
-            "sensors": len(sensors_rows),
-            "actuator": len(actuator_rows),
-            "status": len(status_rows),
-            "cmd": len(cmd_rows),
-            "dt": len(dt_rows),
+        "influx": {"url": INFLUX_URL, "org": INFLUX_ORG, "bucket": INFLUX_BUCKET, "ok": influx_ok, "message": influx_message},
+        "mqtt": {"broker": MQTT_BROKER, "port": MQTT_PORT, "qos": MQTT_QOS, "connected": mqtt_connected},
+        "topics": TOPICS,
+        "command_controller": {
+            "ack_timeout_s": COMMAND_ACK_TIMEOUT_S,
+            "max_retries": COMMAND_MAX_RETRIES,
+            "pump_debounce_ms": PUMP_DEBOUNCE_MS,
+            "light_debounce_ms": LIGHT_DEBOUNCE_MS,
+            "pump_min_interval_s": PUMP_MIN_INTERVAL_S,
+            "light_min_interval_s": LIGHT_MIN_INTERVAL_S,
         },
         "timestamp": utc_now_iso(),
     }
@@ -688,8 +949,27 @@ def dashboard_latest(
 
 @app.get("/api/realtime/latest")
 async def realtime_latest() -> dict[str, Any]:
+    async with COMMAND_LOCK:
+        pending = [
+            {
+                "command_id": c.command_id,
+                "target": c.target,
+                "state": c.desired_state,
+                "seq": c.seq,
+                "status": c.status,
+                "retry_count": c.retries,
+            }
+            for c in PENDING_COMMANDS.values()
+        ]
+        queued = [
+            {"command_id": c.command_id, "target": c.target, "state": c.desired_state, "seq": c.seq, "status": c.status}
+            for c in LATEST_DESIRED_BY_TARGET.values()
+        ]
     return {
+        "api_version": API_VERSION,
         "latest": LATEST,
+        "pending_commands": pending,
+        "queued_latest_commands": queued,
         "buffer_count": len(EVENT_BUFFER),
         "websocket_clients": await manager.count(),
         "timestamp": utc_now_iso(),
@@ -700,8 +980,15 @@ async def realtime_latest() -> dict[str, Any]:
 async def realtime_ingest(event: RealtimeIngestEvent, x_realtime_token: str | None = Header(default=None)) -> dict[str, Any]:
     if REALTIME_INGEST_TOKEN and x_realtime_token != REALTIME_INGEST_TOKEN:
         raise HTTPException(status_code=401, detail="Invalid realtime ingest token")
-    event_dict = event.model_dump() if hasattr(event, "model_dump") else event.dict()
-    latest_patch = apply_realtime_event(event_dict)
+    event_dict = model_to_dict(event)
+    latest_patch = apply_realtime_event_sync(event_dict)
+
+    # ACK handling phải chạy sau apply cache.
+    if event.type == "actuator_state":
+        await ack_direct_command_from_actuator(flatten_actuator_payload(event.data))
+    if event.type in ("esp32_status", "planting_start_ack"):
+        await ack_planting_start_from_status(event.data)
+
     out = {**event_dict, "latest": latest_patch}
     await manager.broadcast(out)
     return {"ok": True, "type": event.type, "latest_keys": list(latest_patch.keys()), "timestamp": utc_now_iso()}
@@ -719,7 +1006,6 @@ async def websocket_realtime(websocket: WebSocket):
             "timestamp": utc_now_iso(),
         })
         while True:
-            # Keep the connection alive and allow client ping messages.
             try:
                 msg = await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
                 if msg.strip().lower() == "ping":
@@ -732,113 +1018,121 @@ async def websocket_realtime(websocket: WebSocket):
         await manager.disconnect(websocket)
 
 
+@app.get("/api/dashboard/latest")
+def dashboard_latest(
+    minutes: int = Query(default=30, ge=1, le=60 * 24 * 31),
+    date: str | None = Query(default=None),
+    prefer_realtime: bool = Query(default=True),
+) -> dict[str, Any]:
+    if prefer_realtime and date is None and any(LATEST.get(k) for k in ("sensors", "actuator", "status", "command_event", "dt_command")):
+        return {
+            "node_id": NODE_ID,
+            "plant": PLANT_NAME,
+            "api_version": API_VERSION,
+            "realtime_only": True,
+            "realtime_updated_at": LATEST.get("updated_at"),
+            "sensors": LATEST.get("sensors"),
+            "actuator": LATEST.get("actuator"),
+            "status": LATEST.get("status"),
+            "command_event": LATEST.get("command_event"),
+            "dt_command": LATEST.get("dt_command"),
+            "counts": {"sensors": 0, "actuator": 0, "status": 0, "cmd": 0, "dt": 0},
+            "timestamp": utc_now_iso(),
+        }
+
+    sensors_rows = query_measurement(MEAS_SENSORS, minutes=minutes, date=date, limit=120)
+    actuator_rows = query_measurement(MEAS_ACTUATOR, minutes=minutes, date=date, limit=50)
+    status_rows = query_measurement(MEAS_STATUS, minutes=minutes, date=date, limit=50)
+    cmd_rows = query_measurement(MEAS_CMD, minutes=minutes, date=date, limit=50)
+    dt_rows = query_measurement(MEAS_DT, minutes=minutes, date=date, limit=50)
+    return {
+        "node_id": NODE_ID,
+        "plant": PLANT_NAME,
+        "api_version": API_VERSION,
+        "realtime_only": False,
+        "realtime_updated_at": LATEST.get("updated_at"),
+        "sensors": LATEST.get("sensors") or (sensors_rows[-1] if sensors_rows else None),
+        "actuator": LATEST.get("actuator") or (actuator_rows[-1] if actuator_rows else None),
+        "status": LATEST.get("status") or (parse_status_record(status_rows[-1]) if status_rows else None),
+        "command_event": LATEST.get("command_event") or (cmd_rows[-1] if cmd_rows else None),
+        "dt_command": LATEST.get("dt_command") or (dt_rows[-1] if dt_rows else None),
+        "counts": {"sensors": len(sensors_rows), "actuator": len(actuator_rows), "status": len(status_rows), "cmd": len(cmd_rows), "dt": len(dt_rows)},
+        "timestamp": utc_now_iso(),
+    }
+
+
 @app.get("/api/history/{measurement}")
 def history(
     measurement: Literal["sensors", "actuator", "status", "cmd", "dt"],
-    minutes: int = Query(default=720, ge=1, le=60 * 24 * 31),
+    minutes: int = Query(default=30, ge=1, le=60 * 24 * 31),
     date: str | None = Query(default=None),
-    limit: int = Query(default=300, ge=1, le=5000),
+    limit: int = Query(default=120, ge=1, le=5000),
 ) -> dict[str, Any]:
     rows = query_measurement(measurement, minutes=minutes, date=date, limit=limit)
     if measurement == MEAS_STATUS:
         rows = [parse_status_record(row) or row for row in rows]
-    return {"measurement": measurement, "count": len(rows), "data": rows}
+    return {"measurement": measurement, "count": len(rows), "data": rows, "api_version": API_VERSION}
 
 
 @app.get("/api/history/sensors")
 def history_sensors(
-    minutes: int = Query(default=720, ge=1, le=60 * 24 * 31),
+    minutes: int = Query(default=30, ge=1, le=60 * 24 * 31),
     date: str | None = Query(default=None),
-    limit: int = Query(default=300, ge=1, le=5000),
+    limit: int = Query(default=120, ge=1, le=5000),
 ) -> dict[str, Any]:
     rows = query_measurement(MEAS_SENSORS, minutes=minutes, date=date, limit=limit)
-    return {"measurement": MEAS_SENSORS, "count": len(rows), "data": rows}
-
-
-@app.get("/api/history/actuator")
-def history_actuator(
-    minutes: int = Query(default=720, ge=1, le=60 * 24 * 31),
-    date: str | None = Query(default=None),
-    limit: int = Query(default=300, ge=1, le=5000),
-) -> dict[str, Any]:
-    rows = query_measurement(MEAS_ACTUATOR, minutes=minutes, date=date, limit=limit)
-    return {"measurement": MEAS_ACTUATOR, "count": len(rows), "data": rows}
-
-
-@app.get("/api/history/status")
-def history_status(
-    minutes: int = Query(default=720, ge=1, le=60 * 24 * 31),
-    date: str | None = Query(default=None),
-    limit: int = Query(default=300, ge=1, le=5000),
-) -> dict[str, Any]:
-    rows = query_measurement(MEAS_STATUS, minutes=minutes, date=date, limit=limit)
-    rows = [parse_status_record(row) or row for row in rows]
-    return {"measurement": MEAS_STATUS, "count": len(rows), "data": rows}
+    return {"measurement": MEAS_SENSORS, "count": len(rows), "data": rows, "api_version": API_VERSION}
 
 
 @app.post("/api/command/pump")
 async def command_pump(cmd: PumpCommand) -> dict[str, Any]:
-    duration = 0 if cmd.state == "OFF" else cmd.duration_s
-    command_id = make_command_id(cmd.source)
+    duration = 0 if cmd.state == "OFF" else min(cmd.duration_s, PUMP_MAX_DURATION_S)
     payload = {
-        "id": command_id,
-        "command_id": command_id,
-        "source": cmd.source,
         "mode": "DIRECT",
         "target": "pump",
         "state": cmd.state,
         "duration_s": duration,
-        "reason": cmd.reason,
-        "sent_at": utc_now_iso(),
     }
-    return await create_and_send_command("pump", payload, cmd.source, cmd.reason)
+    return await submit_coalesced_command("pump", payload, cmd.source, cmd.reason)
 
 
 @app.post("/api/command/light")
 async def command_light(cmd: LightCommand) -> dict[str, Any]:
-    duration = 0 if cmd.state == "OFF" else cmd.duration_s
-    command_id = make_command_id(cmd.source)
+    duration = 0 if cmd.state == "OFF" else min(cmd.duration_s, LIGHT_MAX_DURATION_S)
     payload = {
-        "id": command_id,
-        "command_id": command_id,
-        "source": cmd.source,
         "mode": "DIRECT",
         "target": "light",
         "state": cmd.state,
         "duration_s": duration,
-        "reason": cmd.reason,
-        "sent_at": utc_now_iso(),
     }
-    return await create_and_send_command("light", payload, cmd.source, cmd.reason)
+    return await submit_coalesced_command("light", payload, cmd.source, cmd.reason)
 
 
 @app.post("/api/command/planting-start")
 async def command_planting_start(cmd: PlantingStartCommand) -> dict[str, Any]:
-    command_id = make_command_id(cmd.source)
     action = cmd.action
     epoch = cmd.planting_start_epoch
-    # Avoid retained SET_NOW replay later. Convert SET_NOW to a stable SET_EPOCH at backend time.
+    # Không retain SET_NOW vì replay sau này sẽ thành "now" sai thời điểm.
+    # Backend đổi SET_NOW -> SET_EPOCH cố định tại thời điểm bấm.
     if action == "SET_NOW":
         action = "SET_EPOCH"
         epoch = unix_now_s()
     if action == "SET_EPOCH" and not epoch:
         raise HTTPException(status_code=400, detail="SET_EPOCH requires planting_start_epoch")
-    payload = {
-        "id": command_id,
-        "command_id": command_id,
-        "source": cmd.source,
+    payload: dict[str, Any] = {
         "target": "planting_start",
         "action": action,
-        "reason": cmd.reason,
-        "sent_at": utc_now_iso(),
     }
     if action == "SET_EPOCH":
         payload["planting_start_epoch"] = int(epoch or 0)
-    return await create_and_send_command("planting_start", payload, cmd.source, cmd.reason)
+    return await submit_immediate_command("planting_start", payload, cmd.source, cmd.reason)
 
 
 @app.get("/api/export/sensors.csv")
-def export_sensors_csv(minutes: int = Query(default=720, ge=1, le=60 * 24 * 31), date: str | None = Query(default=None)) -> StreamingResponse:
+def export_sensors_csv(
+    minutes: int = Query(default=720, ge=1, le=60 * 24 * 31),
+    date: str | None = Query(default=None),
+) -> StreamingResponse:
     rows = query_measurement(MEAS_SENSORS, minutes=minutes, date=date, limit=5000)
     df = pd.DataFrame(rows)
     buffer = StringIO()

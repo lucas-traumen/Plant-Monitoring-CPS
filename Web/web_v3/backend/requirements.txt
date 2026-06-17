@@ -1,7 +1,8 @@
-fastapi
-uvicorn[standard]
-pandas
-numpy
-python-dotenv
-influxdb-client
-pydantic
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+paho-mqtt>=1.6.1
+influxdb-client>=1.50.0
+python-dotenv>=1.0.1
+pandas>=2.2.0
+numpy>=1.26.0
+pydantic>=2.0.0

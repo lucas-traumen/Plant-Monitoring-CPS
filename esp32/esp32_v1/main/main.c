@@ -84,7 +84,7 @@ static const wifi_cred_t WIFI_NETWORKS[] = {
 
 #define NODE_ID              "BRASSICA_JUNCEA_01"
 #define PLANT_NAME           "Rau Cải Mầm (Brassica juncea)"
-#define FW_VERSION           "2.9.3-filter-fusion-planting-sync"
+#define FW_VERSION           "2.9.4-direct-command-ack"
 
 /* MQTT */
 #define MQTT_BROKER_URI      "mqtt://192.168.4.1"   /* Raspberry Pi hotspot broker */
@@ -210,6 +210,7 @@ static const ads111x_mux_t SOIL_MUX[SOIL_CH_COUNT] = {
 #define NVS_KEY_START_EPOCH "start_epoch"
 #define NVS_KEY_LAST_CMD_ID "last_cmd"
 #define PLANTING_CMD_ID_MAX 64
+#define DIRECT_CMD_ID_MAX   64
 
 /* Task core pinning */
 #define CORE_NET            0
@@ -286,6 +287,14 @@ static bool              s_sntp_started = false;
 static time_t            s_planting_start_epoch = 0;
 static bool              s_planting_start_valid = false;
 static char              s_last_planting_cmd_id[PLANTING_CMD_ID_MAX] = {0};
+
+/* v2.9.4: lưu command_id/seq gần nhất của Pump/Light direct để publish actuator_state ACK chính xác.
+ * Backend v1.3.0 sẽ ưu tiên ACK theo last_pump_command_id/last_light_command_id.
+ */
+static char              s_last_pump_cmd_id[DIRECT_CMD_ID_MAX] = {0};
+static int               s_last_pump_cmd_seq = 0;
+static char              s_last_light_cmd_id[DIRECT_CMD_ID_MAX] = {0};
+static int               s_last_light_cmd_seq = 0;
 
 /**
  * @brief Cấu trúc bản ghi chứa toàn bộ dữ liệu Snapshot từ cảm biến
@@ -1518,16 +1527,24 @@ static void publish_actuator_state(const char *event_reason) {
     char ts[32] = {0};
     rtc_get_iso(ts, sizeof(ts));
 
-    char payload[512];
+    char payload[768];
     int len = snprintf(payload, sizeof(payload),
         "{"
         "\"node_id\":\"%s\","
         "\"timestamp\":\"%s\","
         "\"event\":\"%s\","
+        "\"last_pump_command_id\":\"%s\","
+        "\"last_pump_seq\":%d,"
+        "\"last_light_command_id\":\"%s\","
+        "\"last_light_seq\":%d,"
         "\"pump\":{\"state\":\"%s\",\"mode\":\"%s\",\"reason\":\"%s\"},"
         "\"light\":{\"state\":\"%s\",\"mode\":\"%s\",\"reason\":\"%s\"}"
         "}",
         NODE_ID, ts, event_reason ? event_reason : "STATE",
+        s_last_pump_cmd_id[0] ? s_last_pump_cmd_id : "",
+        s_last_pump_cmd_seq,
+        s_last_light_cmd_id[0] ? s_last_light_cmd_id : "",
+        s_last_light_cmd_seq,
         snap.pump_state ? "ON" : "OFF",
         snap.pump_mode[0] ? snap.pump_mode : "AI_AUTO",
         snap.pump_reason[0] ? snap.pump_reason : "UNKNOWN",
@@ -1599,7 +1616,13 @@ static void handle_auto_pump_command(esp_mqtt_event_handle_t ev) {
 static void handle_dt_pump_command(esp_mqtt_event_handle_t ev) {
     char payload[256];
     char reason[32] = {0};
+    char cmd_id[DIRECT_CMD_ID_MAX] = {0};
     mqtt_data_to_cstr(ev, payload, sizeof(payload));
+
+    json_get_string_value(payload, "command_id", cmd_id, sizeof(cmd_id));
+    if (!cmd_id[0]) json_get_string_value(payload, "id", cmd_id, sizeof(cmd_id));
+    if (cmd_id[0]) strlcpy(s_last_pump_cmd_id, cmd_id, sizeof(s_last_pump_cmd_id));
+    s_last_pump_cmd_seq = json_get_int_value(payload, "seq", s_last_pump_cmd_seq);
 
     bool on = parse_on_off_command(payload, false);
     int duration_s = parse_duration_s(payload, DT_PUMP_DEFAULT_DURATION_S, DT_PUMP_MAX_DURATION_S);
@@ -1615,14 +1638,22 @@ static void handle_dt_pump_command(esp_mqtt_event_handle_t ev) {
         set_pump_state(false, "DIRECT_DT", reason);
     }
 
-    ESP_LOGW(TAG, "DT command: Pump -> %s duration=%ds reason=%s", on ? "ON" : "OFF", duration_s, reason);
+    ESP_LOGW(TAG, "DT command: Pump -> %s duration=%ds reason=%s cmd_id=%s seq=%d",
+             on ? "ON" : "OFF", duration_s, reason,
+             s_last_pump_cmd_id[0] ? s_last_pump_cmd_id : "NONE", s_last_pump_cmd_seq);
     publish_actuator_state("DT_CMD_PUMP");
 }
 
 static void handle_dt_light_command(esp_mqtt_event_handle_t ev, const char *mode_name) {
     char payload[256];
     char reason[32] = {0};
+    char cmd_id[DIRECT_CMD_ID_MAX] = {0};
     mqtt_data_to_cstr(ev, payload, sizeof(payload));
+
+    json_get_string_value(payload, "command_id", cmd_id, sizeof(cmd_id));
+    if (!cmd_id[0]) json_get_string_value(payload, "id", cmd_id, sizeof(cmd_id));
+    if (cmd_id[0]) strlcpy(s_last_light_cmd_id, cmd_id, sizeof(s_last_light_cmd_id));
+    s_last_light_cmd_seq = json_get_int_value(payload, "seq", s_last_light_cmd_seq);
 
     bool on = parse_on_off_command(payload, false);
     int duration_s = parse_duration_s(payload, DT_LIGHT_DEFAULT_DURATION_S, DT_LIGHT_MAX_DURATION_S);
@@ -1638,8 +1669,9 @@ static void handle_dt_light_command(esp_mqtt_event_handle_t ev, const char *mode
         set_light_state(false, mode_name ? mode_name : "DIRECT_DT", reason);
     }
 
-    ESP_LOGW(TAG, "%s command: Light -> %s duration=%ds reason=%s",
-             mode_name ? mode_name : "DT", on ? "ON" : "OFF", duration_s, reason);
+    ESP_LOGW(TAG, "%s command: Light -> %s duration=%ds reason=%s cmd_id=%s seq=%d",
+             mode_name ? mode_name : "DT", on ? "ON" : "OFF", duration_s, reason,
+             s_last_light_cmd_id[0] ? s_last_light_cmd_id : "NONE", s_last_light_cmd_seq);
     publish_actuator_state("DT_CMD_LIGHT");
 }
 

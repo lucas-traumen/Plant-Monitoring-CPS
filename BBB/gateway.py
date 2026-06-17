@@ -67,7 +67,7 @@ BASE_DIR = Path(__file__).resolve().parent
 
 NODE_ID = "BRASSICA_JUNCEA_01"
 PLANT_NAME = "Rau Cải Mầm (Brassica juncea)"
-GW_VERSION = "3.7.0-realtime-bridge-latest-db"
+GW_VERSION = "3.8.0-web-first-realtime-bridge"
 
 MODEL_PATH = BASE_DIR / "watering_random_forest_model.pkl"
 FEATURES_PATH = BASE_DIR / "model_features.json"
@@ -104,7 +104,7 @@ TOPIC_CMD_PLANTING_START = f"{TOPIC_ROOT}/{NODE_TOPIC_ID}/cmd/config/planting_st
 # ── InfluxDB Cloud ───────────────────────────────────────────────────────────
 ## Không hard-code token trong source code. Export biến môi trường trước khi chạy.
 INFLUX_URL_DEFAULT = "https://us-east-1-1.aws.cloud2.influxdata.com"
-INFLUX_TOKEN_DEFAULT = "6pSuWQaFLlWq6iRVfaRYEMwIO1DDEChBsG42HdDx5En6fuqpUx95j3xswbVNrcWxRrs_sizN6XXESjzNqcHzJA=="
+INFLUX_TOKEN_DEFAULT = ""
 INFLUX_ORG_DEFAULT = "DEV_TEAM"
 INFLUX_BUCKET_DEFAULT = "digital_twin_data"
 
